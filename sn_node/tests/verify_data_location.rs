@@ -10,7 +10,7 @@
 mod common;
 
 use crate::common::{
-    client::{get_all_rpc_addresses, get_gossip_client_and_funded_wallet},
+    client::{get_all_rpc_addresses, get_client_and_funded_wallet},
     get_all_peer_ids, get_safenode_rpc_client, NodeRestart,
 };
 use assert_fs::TempDir;
@@ -21,7 +21,7 @@ use libp2p::{
     PeerId,
 };
 use rand::{rngs::OsRng, Rng};
-use sn_client::{Client, FilesApi, FilesUpload, WalletClient};
+use sn_client::{Client, FilesApi, Uploader, WalletClient};
 use sn_logging::LogBuilder;
 use sn_networking::{sort_peers_by_key, CLOSE_GROUP_SIZE};
 use sn_protocol::{
@@ -108,8 +108,7 @@ async fn verify_data_location() -> Result<()> {
 
     let paying_wallet_dir = TempDir::new()?;
 
-    let (client, _paying_wallet) =
-        get_gossip_client_and_funded_wallet(paying_wallet_dir.path()).await?;
+    let (client, _paying_wallet) = get_client_and_funded_wallet(paying_wallet_dir.path()).await?;
 
     store_chunks(client.clone(), chunk_count, paying_wallet_dir.to_path_buf()).await?;
     store_registers(client, register_count, paying_wallet_dir.to_path_buf()).await?;
@@ -149,11 +148,15 @@ async fn verify_data_location() -> Result<()> {
         let response = rpc_client
             .node_info(Request::new(NodeInfoRequest {}))
             .await?;
-        let peer_id = PeerId::from_bytes(&response.get_ref().peer_id)?;
+        let new_peer_id = PeerId::from_bytes(&response.get_ref().peer_id)?;
         // The below indexing assumes that, the way we do iteration to retrieve all_peers inside get_all_rpc_addresses
         // and get_all_peer_ids is the same as how we do the iteration inside NodeRestart.
         // todo: make this more cleaner.
-        all_peers[node_index] = peer_id;
+        if all_peers[node_index] == new_peer_id {
+            println!("new and old peer id are the same {new_peer_id:?}");
+            return Err(eyre!("new and old peer id are the same {new_peer_id:?}"));
+        }
+        all_peers[node_index] = new_peer_id;
         node_index += 1;
 
         print_node_close_groups(&all_peers);
@@ -267,7 +270,7 @@ async fn verify_location(all_peers: &Vec<PeerId>, node_rpc_addresses: &[SocketAd
                 .for_each(|expected| failed_peers.push(*expected));
 
             if !failed_peers.is_empty() {
-                failed.insert(PrettyPrintRecordKey::from(key).into_owned(), failed_peers);
+                failed.insert(key.clone(), failed_peers);
             }
         }
 
@@ -276,14 +279,21 @@ async fn verify_location(all_peers: &Vec<PeerId>, node_rpc_addresses: &[SocketAd
             println!("Verification failed for {:?} entries", failed.len());
 
             failed.iter().for_each(|(key, failed_peers)| {
+                let key_addr = NetworkAddress::from_record_key(key);
+                let pretty_key = PrettyPrintRecordKey::from(key);
                 failed_peers.iter().for_each(|peer| {
-                    println!("Record {key:?} is not stored inside {peer:?}");
-                    error!("Record {key:?} is not stored inside {peer:?}");
+                    let peer_addr = NetworkAddress::from_peer(*peer);
+                    let ilog2_distance = peer_addr.distance(&key_addr).ilog2();
+                    println!("Record {pretty_key:?} is not stored inside {peer:?}, with ilog2 distance to be {ilog2_distance:?}");
+                    error!("Record {pretty_key:?} is not stored inside {peer:?}, with ilog2 distance to be {ilog2_distance:?}");
                 });
             });
             info!("State of each node:");
             record_holders.iter().for_each(|(key, node_index)| {
-                info!("Record {key:?} is currently held by node indices {node_index:?}");
+                info!(
+                    "Record {:?} is currently held by node indices {node_index:?}",
+                    PrettyPrintRecordKey::from(key)
+                );
             });
             info!("Node index map:");
             all_peers
@@ -317,10 +327,6 @@ async fn verify_location(all_peers: &Vec<PeerId>, node_rpc_addresses: &[SocketAd
 async fn store_chunks(client: Client, chunk_count: usize, wallet_dir: PathBuf) -> Result<()> {
     let start = Instant::now();
     let mut rng = OsRng;
-    let files_api = FilesApi::new(client, wallet_dir);
-    let mut file_upload = FilesUpload::new(files_api)
-        .set_show_holders(true)
-        .set_verify_store(false);
 
     let mut uploaded_chunks_count = 0;
     loop {
@@ -350,7 +356,13 @@ async fn store_chunks(client: Client, chunk_count: usize, wallet_dir: PathBuf) -
 
         let key =
             PrettyPrintRecordKey::from(&RecordKey::new(&head_chunk_addr.xorname())).into_owned();
-        file_upload.upload_chunks(chunks).await?;
+
+        let mut uploader = Uploader::new(client.clone(), wallet_dir.clone());
+        uploader.set_show_holders(true);
+        uploader.set_verify_store(false);
+        uploader.insert_chunk_paths(chunks);
+        let _upload_stats = uploader.start_upload().await?;
+
         uploaded_chunks_count += 1;
 
         println!("Stored Chunk with {head_chunk_addr:?} / {key:?}");
@@ -390,12 +402,7 @@ async fn store_registers(client: Client, register_count: usize, wallet_dir: Path
         debug!("Creating Register at {addr:?}");
 
         let (mut register, ..) = client
-            .create_and_pay_for_register(
-                meta,
-                &mut wallet_client,
-                true,
-                Permissions::new_owner_only(),
-            )
+            .create_and_pay_for_register(meta, &mut wallet_client, true, Permissions::default())
             .await?;
 
         println!("Editing Register at {addr:?}");

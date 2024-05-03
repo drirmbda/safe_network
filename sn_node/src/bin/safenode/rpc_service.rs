@@ -6,20 +6,17 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use bls::{PublicKey, PK_SIZE};
-use bytes::Bytes;
 use eyre::{ErrReport, Result};
+use sn_logging::ReloadHandle;
 use sn_node::RunningNode;
 use sn_protocol::node_rpc::NodeCtrl;
 use sn_protocol::safenode_proto::{
     k_buckets_response,
     safe_node_server::{SafeNode, SafeNodeServer},
-    GossipsubPublishRequest, GossipsubPublishResponse, GossipsubSubscribeRequest,
-    GossipsubSubscribeResponse, GossipsubUnsubscribeRequest, GossipsubUnsubscribeResponse,
     KBucketsRequest, KBucketsResponse, NetworkInfoRequest, NetworkInfoResponse, NodeEvent,
     NodeEventsRequest, NodeInfoRequest, NodeInfoResponse, RecordAddressesRequest,
     RecordAddressesResponse, RestartRequest, RestartResponse, StopRequest, StopResponse,
-    TransferNotifsFilterRequest, TransferNotifsFilterResponse, UpdateRequest, UpdateResponse,
+    UpdateLogLevelRequest, UpdateLogLevelResponse, UpdateRequest, UpdateResponse,
 };
 use std::{
     collections::HashMap,
@@ -40,6 +37,7 @@ struct SafeNodeRpcService {
     running_node: RunningNode,
     ctrl_tx: Sender<NodeCtrl>,
     started_instant: Instant,
+    log_reload_handle: ReloadHandle,
 }
 
 // Implementing RPC interface for service defined in .proto
@@ -144,37 +142,6 @@ impl SafeNode for SafeNodeRpcService {
         Ok(Response::new(ReceiverStream::new(client_rx)))
     }
 
-    async fn transfer_notifs_filter(
-        &self,
-        request: Request<TransferNotifsFilterRequest>,
-    ) -> Result<Response<TransferNotifsFilterResponse>, Status> {
-        debug!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let mut pk_bytes = [0u8; PK_SIZE];
-        pk_bytes.copy_from_slice(&request.get_ref().pk);
-        let pk = match PublicKey::from_bytes(pk_bytes) {
-            Ok(pk) => pk,
-            Err(err) => {
-                return Err(Status::new(
-                    Code::Internal,
-                    format!("Failed to decode provided pk: {err}"),
-                ))
-            }
-        };
-
-        match self.running_node.transfer_notifs_filter(Some(pk)) {
-            Ok(()) => Ok(Response::new(TransferNotifsFilterResponse {})),
-            Err(err) => Err(Status::new(
-                Code::Internal,
-                format!("Failed to set transfer notifs filter with {pk:?}: {err}"),
-            )),
-        }
-    }
-
     async fn record_addresses(
         &self,
         request: Request<RecordAddressesRequest>,
@@ -221,59 +188,6 @@ impl SafeNode for SafeNodeRpcService {
             .collect();
 
         Ok(Response::new(KBucketsResponse { kbuckets }))
-    }
-
-    async fn subscribe_to_topic(
-        &self,
-        request: Request<GossipsubSubscribeRequest>,
-    ) -> Result<Response<GossipsubSubscribeResponse>, Status> {
-        debug!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let topic = &request.get_ref().topic;
-
-        // Assuming the rpc subscription request also force the node to handle the gossip.
-        // So far, this is only used during test to allow counting the gossip msgs received by node.
-        self.running_node.start_handle_gossip();
-        self.running_node.subscribe_to_topic(topic.clone());
-        Ok(Response::new(GossipsubSubscribeResponse {}))
-    }
-
-    async fn unsubscribe_from_topic(
-        &self,
-        request: Request<GossipsubUnsubscribeRequest>,
-    ) -> Result<Response<GossipsubUnsubscribeResponse>, Status> {
-        debug!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let topic = &request.get_ref().topic;
-
-        self.running_node.unsubscribe_from_topic(topic.clone());
-        Ok(Response::new(GossipsubUnsubscribeResponse {}))
-    }
-
-    async fn publish_on_topic(
-        &self,
-        request: Request<GossipsubPublishRequest>,
-    ) -> Result<Response<GossipsubPublishResponse>, Status> {
-        debug!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let topic = &request.get_ref().topic;
-        // Convert the message from Vec<u8> to Bytes
-        let msg = Bytes::from(request.get_ref().msg.clone());
-
-        self.running_node.publish_on_topic(topic.clone(), msg);
-        Ok(Response::new(GossipsubPublishResponse {}))
     }
 
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
@@ -347,6 +261,28 @@ impl SafeNode for SafeNodeRpcService {
             )),
         }
     }
+
+    async fn update_log_level(
+        &self,
+        request: Request<UpdateLogLevelRequest>,
+    ) -> Result<Response<UpdateLogLevelResponse>, Status> {
+        debug!(
+            "RPC request received at {}: {:?}",
+            self.addr,
+            request.get_ref()
+        );
+
+        match self
+            .log_reload_handle
+            .modify_log_level(&request.get_ref().log_level)
+        {
+            Ok(()) => Ok(Response::new(UpdateLogLevelResponse {})),
+            Err(err) => Err(Status::new(
+                Code::Internal,
+                format!("Failed to update node's log level: {err:?}"),
+            )),
+        }
+    }
 }
 
 pub(crate) fn start_rpc_service(
@@ -355,6 +291,7 @@ pub(crate) fn start_rpc_service(
     running_node: RunningNode,
     ctrl_tx: Sender<NodeCtrl>,
     started_instant: Instant,
+    log_reload_handle: ReloadHandle,
 ) {
     // creating a service
     let service = SafeNodeRpcService {
@@ -363,6 +300,7 @@ pub(crate) fn start_rpc_service(
         running_node,
         ctrl_tx,
         started_instant,
+        log_reload_handle,
     };
     info!("RPC Server listening on {addr}");
     println!("RPC Server listening on {addr}");

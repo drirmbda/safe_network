@@ -15,12 +15,17 @@ mod signed_spend;
 mod transaction;
 mod unique_keys;
 
+pub const CASHNOTE_PURPOSE_OF_GENESIS: &str = "GENESIS";
+pub const CASHNOTE_PURPOSE_OF_NETWORK_ROYALTIES: &str = "ROYALTY";
+pub const CASHNOTE_PURPOSE_OF_CHANGE: &str = "CHANGE";
+pub const CASHNOTE_PURPOSE_OF_TRANSFER: &str = "TRANSFER";
+
 pub(crate) use builder::{CashNoteBuilder, TransactionBuilder};
 pub(crate) use transaction::Input;
 
 pub use address::SpendAddress;
 pub use builder::UnsignedTransfer;
-pub use cashnote::CashNote;
+pub use cashnote::{CashNote, CashNoteOutputDetails};
 pub use nano::NanoTokens;
 pub use reason_hash::Hash;
 pub use signed_spend::{SignedSpend, Spend};
@@ -30,11 +35,12 @@ pub use unique_keys::{DerivationIndex, DerivedSecretKey, MainPubkey, MainSecretK
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::Error;
+    use crate::TransferError;
     use transaction::Output;
 
     #[test]
-    fn from_hex_should_deserialize_a_hex_encoded_string_to_a_cashnote() -> Result<(), Error> {
+    fn from_hex_should_deserialize_a_hex_encoded_string_to_a_cashnote() -> Result<(), TransferError>
+    {
         let mut rng = crate::rng::from_seed([0u8; 32]);
         let amount = 1_530_000_000;
         let main_key = MainSecretKey::random_from_rng(&mut rng);
@@ -42,12 +48,17 @@ pub(crate) mod tests {
         let derived_key = main_key.derive_key(&derivation_index);
         let tx = Transaction {
             inputs: vec![],
-            outputs: vec![Output::new(derived_key.unique_pubkey(), amount)],
+            outputs: vec![Output::new(
+                derived_key.unique_pubkey(),
+                amount,
+                "maidsafe_test".to_string(),
+            )],
         };
         let cashnote = CashNote {
-            id: derived_key.unique_pubkey(),
-            src_tx: tx,
-            signed_spends: Default::default(),
+            unique_pubkey: derived_key.unique_pubkey(),
+            parent_tx: tx,
+            parent_spends: Default::default(),
+            purpose: Default::default(),
             main_pubkey: main_key.main_pubkey(),
             derivation_index,
         };
@@ -61,7 +72,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn to_hex_should_serialize_a_cashnote_to_a_hex_encoded_string() -> Result<(), Error> {
+    fn to_hex_should_serialize_a_cashnote_to_a_hex_encoded_string() -> Result<(), TransferError> {
         let mut rng = crate::rng::from_seed([0u8; 32]);
         let amount = 100;
         let main_key = MainSecretKey::random_from_rng(&mut rng);
@@ -69,12 +80,17 @@ pub(crate) mod tests {
         let derived_key = main_key.derive_key(&derivation_index);
         let tx = Transaction {
             inputs: vec![],
-            outputs: vec![Output::new(derived_key.unique_pubkey(), amount)],
+            outputs: vec![Output::new(
+                derived_key.unique_pubkey(),
+                amount,
+                "maidsafe_test".to_string(),
+            )],
         };
         let cashnote = CashNote {
-            id: derived_key.unique_pubkey(),
-            src_tx: tx,
-            signed_spends: Default::default(),
+            unique_pubkey: derived_key.unique_pubkey(),
+            parent_tx: tx,
+            parent_spends: Default::default(),
+            purpose: Default::default(),
             main_pubkey: main_key.main_pubkey(),
             derivation_index,
         };
@@ -88,7 +104,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn input_should_error_if_unique_pubkey_is_not_derived_from_main_key() -> Result<(), Error> {
+    fn input_should_error_if_unique_pubkey_is_not_derived_from_main_key(
+    ) -> Result<(), TransferError> {
         let mut rng = crate::rng::from_seed([0u8; 32]);
         let amount = 100;
 
@@ -98,13 +115,18 @@ pub(crate) mod tests {
 
         let tx = Transaction {
             inputs: vec![],
-            outputs: vec![Output::new(derived_key.unique_pubkey(), amount)],
+            outputs: vec![Output::new(
+                derived_key.unique_pubkey(),
+                amount,
+                "maidsafe_test".to_string(),
+            )],
         };
 
         let cashnote = CashNote {
-            id: derived_key.unique_pubkey(),
-            src_tx: tx,
-            signed_spends: Default::default(),
+            unique_pubkey: derived_key.unique_pubkey(),
+            parent_tx: tx,
+            parent_spends: Default::default(),
+            purpose: Default::default(),
             main_pubkey: main_key.main_pubkey(),
             derivation_index,
         };
@@ -113,13 +135,13 @@ pub(crate) mod tests {
         let result = cashnote.derived_key(&other_main_key);
         assert!(matches!(
             result,
-            Err(Error::MainSecretKeyDoesNotMatchMainPubkey)
+            Err(TransferError::MainSecretKeyDoesNotMatchMainPubkey)
         ));
         Ok(())
     }
 
     #[test]
-    fn test_cashnote_without_inputs_fails_verification() -> Result<(), Error> {
+    fn test_cashnote_without_inputs_fails_verification() -> Result<(), TransferError> {
         let mut rng = crate::rng::from_seed([0u8; 32]);
         let amount = 100;
 
@@ -129,20 +151,25 @@ pub(crate) mod tests {
 
         let tx = Transaction {
             inputs: vec![],
-            outputs: vec![Output::new(derived_key.unique_pubkey(), amount)],
+            outputs: vec![Output::new(
+                derived_key.unique_pubkey(),
+                amount,
+                "maidsafe_test".to_string(),
+            )],
         };
 
         let cashnote = CashNote {
-            id: derived_key.unique_pubkey(),
-            src_tx: tx,
-            signed_spends: Default::default(),
+            unique_pubkey: derived_key.unique_pubkey(),
+            parent_tx: tx,
+            parent_spends: Default::default(),
+            purpose: Default::default(),
             main_pubkey: main_key.main_pubkey(),
             derivation_index,
         };
 
         assert!(matches!(
             cashnote.verify(&main_key),
-            Err(Error::MissingTxInputs)
+            Err(TransferError::MissingTxInputs)
         ));
 
         Ok(())

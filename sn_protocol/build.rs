@@ -9,6 +9,5 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::compile_protos("./src/safenode_proto/safenode.proto")?;
-    tonic_build::compile_protos("./src/safenode_manager_proto/safenode_manager.proto")?;
     Ok(())
 }

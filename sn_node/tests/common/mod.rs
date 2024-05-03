@@ -21,11 +21,12 @@ use rand::{
 use self_encryption::MIN_ENCRYPTABLE_BYTES;
 use sn_client::{Client, FilesApi};
 use sn_protocol::{
-    node_registry::{get_local_node_registry_path, NodeRegistry},
-    safenode_manager_proto::safe_node_manager_client::SafeNodeManagerClient,
     safenode_proto::{safe_node_client::SafeNodeClient, NodeInfoRequest},
     storage::ChunkAddress,
-    test_utils::DeploymentInventory,
+};
+use sn_service_management::{
+    get_local_node_registry_path,
+    safenode_manager_proto::safe_node_manager_client::SafeNodeManagerClient, NodeRegistry,
 };
 use std::{
     fs::File,
@@ -34,6 +35,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use test_utils::testnet::DeploymentInventory;
 use tonic::Request;
 use tracing::{debug, error, warn};
 use xor_name::XorName;

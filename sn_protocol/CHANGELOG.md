@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1](https://github.com/joshuef/safe_network/compare/sn_protocol-v0.16.0...sn_protocol-v0.16.1) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_transfers
+
+## [0.16.0](https://github.com/joshuef/safe_network/compare/sn_protocol-v0.15.5...sn_protocol-v0.16.0) - 2024-03-27
+
+### Added
+- [**breaking**] remove gossip code
+
+## [0.15.5](https://github.com/joshuef/safe_network/compare/sn_protocol-v0.15.4...sn_protocol-v0.15.5) - 2024-03-21
+
+### Added
+- *(protocol)* add rpc to set node log level on the fly
+
+## [0.15.4](https://github.com/joshuef/safe_network/compare/sn_protocol-v0.15.3...sn_protocol-v0.15.4) - 2024-03-14
+
+### Fixed
+- dont stop spend verification at spend error, generalise spend serde
+
+### Other
+- store test utils under a new crate
+- move DeploymentInventory to test utils
+- new `sn_service_management` crate
+- *(release)* sn_transfers-v0.16.3/sn_cli-v0.89.82
+
 ## [0.15.3](https://github.com/joshuef/safe_network/compare/sn_protocol-v0.15.2-alpha.0...sn_protocol-v0.15.3) - 2024-03-08
 
 ### Other

@@ -6,9 +6,8 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use sn_protocol::PrettyPrintRecordKey;
-use sn_registers::RegisterAddress;
-use sn_transfers::{NanoTokens, SpendAddress, WalletError};
+use sn_protocol::{NetworkAddress, PrettyPrintRecordKey};
+use sn_transfers::{NanoTokens, WalletError};
 use thiserror::Error;
 
 pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
@@ -18,7 +17,7 @@ pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
 #[allow(missing_docs)]
 pub enum Error {
     #[error("Network error {0}")]
-    Network(#[from] sn_networking::Error),
+    Network(#[from] sn_networking::NetworkError),
 
     #[error("Protocol error {0}")]
     Protocol(#[from] sn_protocol::Error),
@@ -30,7 +29,7 @@ pub enum Error {
     Wallet(#[from] WalletError),
 
     #[error("Transfers Error {0}")]
-    Transfers(#[from] sn_transfers::Error),
+    Transfers(#[from] sn_transfers::TransferError),
 
     #[error("Failed to parse NodeEvent")]
     NodeEventParsingFailed,
@@ -51,27 +50,13 @@ pub enum Error {
     #[error("The Record::key does not match with the key derived from Record::value")]
     RecordKeyMismatch,
 
-    //  ---------- Spend Errors
-    #[error("Spend was not found locally: {0:?}")]
-    SpendNotFoundLocally(SpendAddress),
-    #[error("The SignedSpends have different UniquePubKey")]
-    MultipleUniquePubKey,
-    #[error("No SignedSpends were provided")]
-    EmptySignedSpends,
-    #[error("Invalid Parent Tx: {0}")]
-    SpendParentTxInvalid(String),
-
-    // ---------- Register Errors
-    #[error("Register was not found locally: {0}")]
-    RegisterNotFoundLocally(Box<RegisterAddress>),
-
     // ---------- Payment Errors
     #[error("The content of the payment quote is invalid")]
     InvalidQuoteContent,
     #[error("The payment quote's signature is invalid")]
     InvalidQuoteSignature,
-    #[error("The payment quote expired")]
-    QuoteExpired,
+    #[error("The payment quote expired for {0:?}")]
+    QuoteExpired(NetworkAddress),
     /// Payment proof received has no inputs
     #[error(
         "Payment proof received with record:{0:?}. No payment for our node in its transaction"
@@ -94,4 +79,10 @@ pub enum Error {
     // ---------- Miscellaneous Errors
     #[error("Failed to obtain node's current port")]
     FailedToGetNodePort,
+    /// The request is invalid or the arguments of the function are invalid
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+    /// Error occurred in an async thread
+    #[error("Error occured in async thread: {0}")]
+    JoinErrorInAsyncThread(String),
 }

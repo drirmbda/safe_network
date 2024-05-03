@@ -10,15 +10,25 @@ pub mod error;
 
 use crate::error::{Error, Result};
 use clap::Args;
+#[cfg(feature = "network-contacts")]
+use lazy_static::lazy_static;
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use rand::{seq::SliceRandom, thread_rng};
+#[cfg(feature = "network-contacts")]
+use sn_protocol::version::get_network_version;
 use tracing::*;
 #[cfg(feature = "network-contacts")]
 use url::Url;
 
 #[cfg(feature = "network-contacts")]
-// URL containing the multi-addresses of the bootstrap nodes.
-const NETWORK_CONTACTS_URL: &str = "https://sn-testnet.s3.eu-west-2.amazonaws.com/network-contacts";
+lazy_static! {
+    // URL containing the multi-addresses of the bootstrap nodes.
+    pub static ref NETWORK_CONTACTS_URL: String = {
+        let version = get_network_version();
+        let version_prefix = if !version.is_empty() { format!("{version}-") } else { version.to_string() };
+        format!("https://sn-testnet.s3.eu-west-2.amazonaws.com/{version_prefix}network-contacts")
+    };
+}
 
 #[cfg(feature = "network-contacts")]
 // The maximum number of retries to be performed while trying to fetch the network contacts file.
@@ -27,7 +37,7 @@ const MAX_NETWORK_CONTACTS_GET_RETRIES: usize = 3;
 /// The name of the environment variable that can be used to pass peers to the node.
 pub const SAFE_PEERS_ENV: &str = "SAFE_PEERS";
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct PeersArgs {
     /// Set to indicate this is the first node in a new network
     ///
@@ -110,13 +120,14 @@ async fn get_network_contacts(_args: &PeersArgs) -> Result<Vec<Multiaddr>> {
 
 #[cfg(feature = "network-contacts")]
 async fn get_network_contacts(args: &PeersArgs) -> Result<Vec<Multiaddr>> {
-    info!("Trying to fetch the bootstrap peers from {NETWORK_CONTACTS_URL}");
-    println!("Trying to fetch the bootstrap peers from {NETWORK_CONTACTS_URL}");
-
     let url = args
         .network_contacts_url
         .clone()
-        .unwrap_or(Url::parse(NETWORK_CONTACTS_URL)?);
+        .unwrap_or(Url::parse(NETWORK_CONTACTS_URL.as_str())?);
+
+    info!("Trying to fetch the bootstrap peers from {url}");
+    println!("Trying to fetch the bootstrap peers from {url}");
+
     get_bootstrap_peers_from_url(url).await
 }
 
@@ -179,14 +190,14 @@ async fn get_bootstrap_peers_from_url(url: Url) -> Result<Vec<Multiaddr>> {
                         return Ok(multi_addresses);
                     } else {
                         return Err(Error::NoMultiAddrObtainedFromNetworkContacts(
-                            NETWORK_CONTACTS_URL.to_string(),
+                            url.to_string(),
                         ));
                     }
                 } else {
                     retries += 1;
                     if retries >= MAX_NETWORK_CONTACTS_GET_RETRIES {
                         return Err(Error::NetworkContactsUnretrievable(
-                            NETWORK_CONTACTS_URL.to_string(),
+                            url.to_string(),
                             MAX_NETWORK_CONTACTS_GET_RETRIES,
                         ));
                     }
@@ -196,7 +207,7 @@ async fn get_bootstrap_peers_from_url(url: Url) -> Result<Vec<Multiaddr>> {
                 retries += 1;
                 if retries >= MAX_NETWORK_CONTACTS_GET_RETRIES {
                     return Err(Error::NetworkContactsUnretrievable(
-                        NETWORK_CONTACTS_URL.to_string(),
+                        url.to_string(),
                         MAX_NETWORK_CONTACTS_GET_RETRIES,
                     ));
                 }

@@ -106,6 +106,16 @@ pub enum CmdResponse {
     //
     /// Response to replication cmd
     Replicate(Result<()>),
+    //
+    // ===== QuoteVerification =====
+    //
+    /// Response to quote verification cmd
+    QuoteVerification(Result<()>),
+    //
+    // ===== PeerConsideredAsBad =====
+    //
+    /// Response to the considered as bad notification
+    PeerConsideredAsBad(Result<()>),
 }
 
 /// The Ok variant of a CmdResponse

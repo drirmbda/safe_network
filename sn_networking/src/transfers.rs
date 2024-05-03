@@ -6,7 +6,9 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use crate::{close_group_majority, driver::GetRecordCfg, Error, GetRecordError, Network, Result};
+use crate::{
+    close_group_majority, driver::GetRecordCfg, GetRecordError, Network, NetworkError, Result,
+};
 use libp2p::kad::{Quorum, Record};
 use sn_protocol::{
     storage::{try_deserialize_record, RecordHeader, RecordKind, RetryStrategy, SpendAddress},
@@ -19,32 +21,14 @@ use sn_transfers::{
 use std::collections::BTreeSet;
 use tokio::task::JoinSet;
 
-fn parse_signed_spends(address: &SpendAddress, record: &Record) -> Result<SignedSpend> {
-    match get_singed_spends_from_record(record)?.as_slice() {
-        [one, two, ..] => {
-            error!("Found double spend for {address:?}");
-            Err(Error::DoubleSpendAttempt(
-                Box::new(one.to_owned()),
-                Box::new(two.to_owned()),
-            ))
-        }
-        [one] => {
-            trace!("Spend get for address: {address:?} successful");
-            Ok(one.clone())
-        }
-        _ => {
-            trace!("Found no spend for {address:?}");
-            Err(Error::NoSpendFoundInsideRecord(*address))
-        }
-    }
-}
-
 impl Network {
-    /// Gets a spend from the Network.
+    /// Gets raw spends from the Network.
+    /// For normal use please prefer using `get_spend` instead.
+    /// Double spends returned together as is, not as an error.
     /// The target may have high chance not present in the network yet.
     ///
     /// If we get a quorum error, we enable re-try
-    pub async fn try_get_spend(&self, address: SpendAddress) -> Result<SignedSpend> {
+    pub async fn get_raw_spends(&self, address: SpendAddress) -> Result<Vec<SignedSpend>> {
         let key = NetworkAddress::from_spend_address(address).to_record_key();
         let get_cfg = GetRecordCfg {
             get_quorum: Quorum::Majority,
@@ -52,16 +36,12 @@ impl Network {
             target_record: None,
             expected_holders: Default::default(),
         };
-        let record = match self.get_record_from_network(key.clone(), &get_cfg).await {
-            Ok(record) => record,
-            Err(err) => return Err(err),
-        };
+        let record = self.get_record_from_network(key.clone(), &get_cfg).await?;
         debug!(
             "Got record from the network, {:?}",
             PrettyPrintRecordKey::from(&record.key)
         );
-
-        parse_signed_spends(&address, &record)
+        get_raw_signed_spends_from_record(&record)
     }
 
     /// Gets a spend from the Network.
@@ -78,7 +58,7 @@ impl Network {
         };
         let record = match self.get_record_from_network(key.clone(), &get_cfg).await {
             Ok(record) => record,
-            Err(Error::GetRecordError(GetRecordError::NotEnoughCopies {
+            Err(NetworkError::GetRecordError(GetRecordError::NotEnoughCopies {
                 record,
                 expected,
                 got,
@@ -89,11 +69,13 @@ impl Network {
                     get_cfg.retry_strategy = Some(RetryStrategy::Persistent);
                     self.get_record_from_network(key, &get_cfg).await?
                 } else {
-                    return Err(Error::GetRecordError(GetRecordError::NotEnoughCopies {
-                        record,
-                        expected,
-                        got,
-                    }));
+                    return Err(NetworkError::GetRecordError(
+                        GetRecordError::NotEnoughCopies {
+                            record,
+                            expected,
+                            got,
+                        },
+                    ));
                 }
             }
             Err(err) => return Err(err),
@@ -103,7 +85,7 @@ impl Network {
             PrettyPrintRecordKey::from(&record.key)
         );
 
-        parse_signed_spends(&address, &record)
+        get_signed_spend_from_record(&address, &record)
     }
 
     /// This function is used to receive a Transfer and turn it back into spendable CashNotes.
@@ -153,28 +135,29 @@ impl Network {
         let mut parent_spends = BTreeSet::new();
         while let Some(result) = tasks.join_next().await {
             let signed_spend = result
-                .map_err(|e| Error::FailedToGetSpend(format!("{e}")))?
-                .map_err(|e| Error::InvalidTransfer(format!("{e}")))?;
+                .map_err(|e| NetworkError::FailedToGetSpend(format!("{e}")))?
+                .map_err(|e| NetworkError::InvalidTransfer(format!("{e}")))?;
             let _ = parent_spends.insert(signed_spend.clone());
         }
         let parent_txs: BTreeSet<Transaction> =
             parent_spends.iter().map(|s| s.spent_tx()).collect();
 
         // get our outputs from Tx
-        let our_output_unique_pubkeys: Vec<(UniquePubkey, DerivationIndex)> = cashnote_redemptions
-            .iter()
-            .map(|u| {
-                let unique_pubkey = main_pubkey.new_unique_pubkey(&u.derivation_index);
-                (unique_pubkey, u.derivation_index)
-            })
-            .collect();
+        let our_output_unique_pubkeys: Vec<(String, UniquePubkey, DerivationIndex)> =
+            cashnote_redemptions
+                .iter()
+                .map(|u| {
+                    let unique_pubkey = main_pubkey.new_unique_pubkey(&u.derivation_index);
+                    (u.purpose.clone(), unique_pubkey, u.derivation_index)
+                })
+                .collect();
         let mut our_output_cash_notes = Vec::new();
 
-        for (id, derivation_index) in our_output_unique_pubkeys.into_iter() {
+        for (purpose, id, derivation_index) in our_output_unique_pubkeys.into_iter() {
             let src_tx = parent_txs
                 .iter()
                 .find(|tx| tx.outputs.iter().any(|o| o.unique_pubkey() == &id))
-                .ok_or(Error::InvalidTransfer(
+                .ok_or(NetworkError::InvalidTransfer(
                     "None of the CashNoteRedemptions are destined to our key".to_string(),
                 ))?
                 .clone();
@@ -184,9 +167,10 @@ impl Network {
                 .cloned()
                 .collect();
             let cash_note = CashNote {
-                id,
-                src_tx,
-                signed_spends,
+                unique_pubkey: id,
+                parent_tx: src_tx,
+                parent_spends: signed_spends,
+                purpose: purpose.clone(),
                 main_pubkey,
                 derivation_index,
             };
@@ -210,19 +194,22 @@ impl Network {
             }
             while let Some(result) = tasks.join_next().await {
                 let signed_spend = result
-                    .map_err(|e| Error::FailedToGetSpend(format!("{e}")))?
-                    .map_err(|e| Error::InvalidTransfer(format!("{e}")))?;
+                    .map_err(|e| NetworkError::FailedToGetSpend(format!("{e}")))?
+                    .map_err(|e| NetworkError::InvalidTransfer(format!("{e}")))?;
                 let _ = parent_spends.insert(signed_spend.clone());
             }
 
             // verify the Tx against the inputs spends
-            let input_spends = parent_spends
+            let input_spends: BTreeSet<_> = parent_spends
                 .iter()
                 .filter(|s| s.spent_tx_hash() == tx.hash())
                 .cloned()
                 .collect();
             tx.verify_against_inputs_spent(&input_spends).map_err(|e| {
-                Error::InvalidTransfer(format!("Payment parent Tx {:?} invalid: {e}", tx.hash()))
+                NetworkError::InvalidTransfer(format!(
+                    "Payment parent Tx {:?} invalid: {e}",
+                    tx.hash()
+                ))
             })?;
         }
 
@@ -230,14 +217,42 @@ impl Network {
     }
 }
 
-/// Tries to get the signed spend out of a record.
-pub fn get_singed_spends_from_record(record: &Record) -> Result<Vec<SignedSpend>> {
+/// Tries to get the signed spend out of a record as is, double spends are returned together as is.
+pub fn get_raw_signed_spends_from_record(record: &Record) -> Result<Vec<SignedSpend>> {
     let header = RecordHeader::from_record(record)?;
     if let RecordKind::Spend = header.kind {
         let spends = try_deserialize_record::<Vec<SignedSpend>>(record)?;
         Ok(spends)
     } else {
-        error!("RecordKind mismatch while trying to retrieve a Vec<SignedSpend>");
-        Err(Error::RecordKindMismatch(RecordKind::Spend))
+        warn!(
+            "RecordKind mismatch while trying to retrieve spends from record {:?}",
+            PrettyPrintRecordKey::from(&record.key)
+        );
+        Err(NetworkError::RecordKindMismatch(RecordKind::Spend))
+    }
+}
+
+/// Get the signed spend out of a record.
+/// Double spends are returned as an error
+pub fn get_signed_spend_from_record(
+    address: &SpendAddress,
+    record: &Record,
+) -> Result<SignedSpend> {
+    match get_raw_signed_spends_from_record(record)?.as_slice() {
+        [one, two, ..] => {
+            warn!("Found double spend for {address:?}");
+            Err(NetworkError::DoubleSpendAttempt(
+                Box::new(one.to_owned()),
+                Box::new(two.to_owned()),
+            ))
+        }
+        [one] => {
+            trace!("Spend get for address: {address:?} successful");
+            Ok(one.clone())
+        }
+        _ => {
+            trace!("Found no spend for {address:?}");
+            Err(NetworkError::NoSpendFoundInsideRecord(*address))
+        }
     }
 }

@@ -10,10 +10,10 @@
 use crate::record_store::{ClientRecordStore, NodeRecordStore};
 use libp2p::kad::{
     store::{RecordStore, Result},
-    KBucketDistance as Distance, ProviderRecord, Record, RecordKey,
+    ProviderRecord, Record, RecordKey,
 };
 use sn_protocol::{storage::RecordType, NetworkAddress};
-use sn_transfers::NanoTokens;
+use sn_transfers::{NanoTokens, QuotingMetrics};
 use std::{borrow::Cow, collections::HashMap};
 
 pub enum UnifiedRecordStore {
@@ -112,13 +112,13 @@ impl UnifiedRecordStore {
         }
     }
 
-    pub(crate) fn store_cost(&self) -> NanoTokens {
+    pub(crate) fn store_cost(&self, key: &RecordKey) -> (NanoTokens, QuotingMetrics) {
         match self {
             Self::Client(_) => {
                 warn!("Calling store cost calculation at Client. This should not happen");
-                NanoTokens::zero()
+                (NanoTokens::zero(), Default::default())
             }
-            Self::Node(store) => store.store_cost(),
+            Self::Node(store) => store.store_cost(key),
         }
     }
 
@@ -131,13 +131,32 @@ impl UnifiedRecordStore {
         }
     }
 
-    pub(crate) fn get_distance_range(&self) -> Option<Distance> {
+    pub(crate) fn get_farthest_replication_distance_bucket(&self) -> Option<u32> {
         match self {
             Self::Client(_store) => {
                 warn!("Calling get_distance_range at Client. This should not happen");
                 None
             }
-            Self::Node(store) => store.get_distance_range(),
+            Self::Node(store) => store.get_responsible_distance_range(),
+        }
+    }
+
+    pub(crate) fn set_distance_range(&mut self, distance: u32) {
+        match self {
+            Self::Client(_store) => {
+                warn!("Calling set_distance_range at Client. This should not happen");
+            }
+            Self::Node(store) => store.set_responsible_distance_range(distance),
+        }
+    }
+
+    pub(crate) fn get_farthest(&self) -> Option<RecordKey> {
+        match self {
+            Self::Client(_store) => {
+                warn!("Calling get_farthest at Client. This should not happen");
+                None
+            }
+            Self::Node(store) => store.get_farthest(),
         }
     }
 

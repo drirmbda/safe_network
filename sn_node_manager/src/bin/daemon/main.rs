@@ -10,23 +10,16 @@
 extern crate tracing;
 
 use clap::Parser;
-use color_eyre::{
-    self,
-    eyre::{OptionExt, Result},
-};
+use color_eyre::eyre::{eyre, Result};
 use libp2p_identity::PeerId;
-use sn_node_manager::{
-    config::get_node_registry_path,
-    daemon_control::{self, DAEMON_DEFAULT_PORT},
-    service::NodeServiceManager,
-};
-use sn_node_rpc_client::RpcClient;
-use sn_protocol::{
-    node_registry::NodeRegistry,
+use sn_node_manager::{config::get_node_registry_path, rpc, DAEMON_DEFAULT_PORT};
+use sn_service_management::{
     safenode_manager_proto::{
+        get_status_response::Node,
         safe_node_manager_server::{SafeNodeManager, SafeNodeManagerServer},
-        NodeServiceRestartRequest, NodeServiceRestartResponse,
+        GetStatusRequest, GetStatusResponse, NodeServiceRestartRequest, NodeServiceRestartResponse,
     },
+    NodeRegistry,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tonic::{transport::Server, Code, Request, Response, Status};
@@ -55,17 +48,10 @@ impl SafeNodeManager for SafeNodeManagerDaemon {
     ) -> Result<Response<NodeServiceRestartResponse>, Status> {
         println!("RPC request received {:?}", request.get_ref());
         info!("RPC request received {:?}", request.get_ref());
-
-        let node_registry_path = get_node_registry_path().map_err(|err| {
+        let node_registry = Self::load_node_registry().map_err(|err| {
             Status::new(
                 Code::Internal,
-                format!("Could not obtain node registry path {err}"),
-            )
-        })?;
-        let node_registry = NodeRegistry::load(&node_registry_path).map_err(|err| {
-            Status::new(
-                Code::Internal,
-                format!("Could not open local node registry with {err}"),
+                format!("Failed to load node registry: {err}"),
             )
         })?;
 
@@ -80,31 +66,48 @@ impl SafeNodeManager for SafeNodeManagerDaemon {
 
         Ok(Response::new(NodeServiceRestartResponse {}))
     }
+
+    async fn get_status(
+        &self,
+        request: Request<GetStatusRequest>,
+    ) -> Result<Response<GetStatusResponse>, Status> {
+        println!("RPC request received {:?}", request.get_ref());
+        info!("RPC request received {:?}", request.get_ref());
+        let node_registry = Self::load_node_registry().map_err(|err| {
+            Status::new(
+                Code::Internal,
+                format!("Failed to load node registry: {err}"),
+            )
+        })?;
+
+        let nodes_info = node_registry
+            .nodes
+            .iter()
+            .map(|node| Node {
+                peer_id: node.peer_id.map(|id| id.to_bytes()),
+                status: node.status.clone() as i32,
+                number: node.number as u32,
+            })
+            .collect::<Vec<_>>();
+        Ok(Response::new(GetStatusResponse { nodes: nodes_info }))
+    }
 }
 
 impl SafeNodeManagerDaemon {
+    fn load_node_registry() -> Result<NodeRegistry> {
+        let node_registry_path = get_node_registry_path()
+            .map_err(|err| eyre!("Could not obtain node registry path: {err:?}"))?;
+        let node_registry = NodeRegistry::load(&node_registry_path)
+            .map_err(|err| eyre!("Could not load node registry: {err:?}"))?;
+        Ok(node_registry)
+    }
+
     async fn restart_handler(
         mut node_registry: NodeRegistry,
         peer_id: PeerId,
         retain_peer_id: bool,
     ) -> Result<()> {
-        let rpc_socket_addr = node_registry
-            .nodes
-            .iter()
-            .find(|node| node.peer_id.is_some_and(|id| id == peer_id))
-            .ok_or_eyre(format!("Could not find the provided PeerId: {peer_id:?}"))?
-            .rpc_socket_addr;
-
-        let rpc_client = RpcClient::from_socket_addr(rpc_socket_addr);
-
-        let res = daemon_control::restart_node_service(
-            &mut node_registry,
-            peer_id,
-            retain_peer_id,
-            &rpc_client,
-            &NodeServiceManager {},
-        )
-        .await;
+        let res = rpc::restart_node_service(&mut node_registry, peer_id, retain_peer_id).await;
 
         // make sure to save the state even if the above fn fails.
         node_registry.save()?;

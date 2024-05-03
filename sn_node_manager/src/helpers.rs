@@ -11,7 +11,8 @@ use color_eyre::{
     Result,
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use sn_releases::{get_running_platform, ArchiveType, ReleaseType, SafeReleaseRepositoryInterface};
+use semver::Version;
+use sn_releases::{get_running_platform, ArchiveType, ReleaseType, SafeReleaseRepoActions};
 use std::{
     io::Read,
     path::PathBuf,
@@ -22,11 +23,15 @@ use std::{
 const MAX_DOWNLOAD_RETRIES: u8 = 3;
 
 /// Downloads and extracts a release binary to a temporary location.
+///
+/// If the URL is supplied, that will be downloaded and extracted, and the binary inside the
+/// archive will be used; if the version is supplied, a specific version will be downloaded and
+/// used; otherwise the latest version will be downloaded and used.
 pub async fn download_and_extract_release(
     release_type: ReleaseType,
     url: Option<String>,
     version: Option<String>,
-    release_repo: &dyn SafeReleaseRepositoryInterface,
+    release_repo: &dyn SafeReleaseRepoActions,
 ) -> Result<(PathBuf, String)> {
     let pb = Arc::new(ProgressBar::new(0));
     pb.set_style(ProgressStyle::default_bar()
@@ -61,7 +66,7 @@ pub async fn download_and_extract_release(
             }
         } else {
             let version = if let Some(version) = version.clone() {
-                version
+                Version::parse(&version)?
             } else {
                 println!("Retrieving latest version for {release_type}...");
                 release_repo.get_latest_version(&release_type).await?
@@ -89,10 +94,12 @@ pub async fn download_and_extract_release(
         };
     };
     pb.finish_and_clear();
-    println!("Download completed");
 
     let safenode_download_path =
         release_repo.extract_release_archive(&archive_path, &temp_dir_path)?;
+
+    println!("Download completed: {}", &safenode_download_path.display());
+
     // Finally, obtain the version number from the binary by running `--version`. This is useful
     // when the `--url` argument is used, and in any case, ultimately the binary we obtained is the
     // source of truth.
@@ -113,7 +120,6 @@ pub fn get_bin_version(bin_path: &PathBuf) -> Result<String> {
         .ok_or_else(|| eyre!("Failed to capture stdout"))?
         .read_to_string(&mut output)?;
 
-    println!("{output}");
     let version = output
         .split_whitespace()
         .last()

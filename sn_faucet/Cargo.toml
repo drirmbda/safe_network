@@ -8,38 +8,42 @@ license = "GPL-3.0"
 name = "sn_faucet"
 readme = "README.md"
 repository = "https://github.com/maidsafe/safe_network"
-version = "0.3.83"
+version = "0.4.14-alpha.0"
 
 [features]
 default = []
 distribution = ["base64", "bitcoin", "minreq"]
 
 [[bin]]
-path="src/main.rs"
-name="faucet"
+path = "src/main.rs"
+name = "faucet"
 
 [dependencies]
+warp = "0.3"
 assert_fs = "1.0.0"
-base64 = { version = "0.21.7", optional = true }
-bitcoin = { version = "0.31.0", features = ["rand-std", "base64"], optional = true }
+base64 = { version = "0.22.0", optional = true }
+bitcoin = { version = "0.31.0", features = [
+    "rand-std",
+    "base64",
+], optional = true }
 bls = { package = "blsttc", version = "8.0.1" }
 clap = { version = "4.2.1", features = ["derive"] }
 color-eyre = "0.6.2"
 dirs-next = "~2.0.0"
 hex = "0.4.3"
 indicatif = { version = "0.17.5", features = ["tokio"] }
-minreq = { version = "2.11.0", features = ["https-rustls"], optional = true}
+minreq = { version = "2.11.0", features = ["https-rustls"], optional = true }
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0.108"
-sn_client = { path = "../sn_client", version = "0.104.29-alpha.1" }
-sn_logging = { path = "../sn_logging", version = "0.2.21" }
-sn_peers_acquisition = { path = "../sn_peers_acquisition", version = "0.2.6" }
-sn_transfers = { path = "../sn_transfers", version = "0.16.3" }
-tiny_http = { version="0.12", features = ["ssl-rustls"] }
+sn_build_info = { path = "../sn_build_info", version = "0.1.7" }
+sn_client = { path = "../sn_client", version = "0.106.0-alpha.5" }
+sn_logging = { path = "../sn_logging", version = "0.2.26-alpha.0" }
+sn_peers_acquisition = { path = "../sn_peers_acquisition", version = "0.2.11-alpha.0" }
+sn_transfers = { path = "../sn_transfers", version = "0.18.0-alpha.0" }
 tokio = { version = "1.32.0", features = ["parking_lot", "rt"] }
 tracing = { version = "~0.1.26" }
-tracing-core = "0.1.30"
 url = "2.5.0"
+fs2 = "0.4.3"
 
 [lints]
 workspace = true

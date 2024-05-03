@@ -14,64 +14,66 @@ use crate::{
     bootstrap::{ContinuousBootstrap, BOOTSTRAP_INTERVAL},
     circular_vec::CircularVec,
     cmd::SwarmCmd,
-    error::{Error, Result},
-    event::NetworkEvent,
-    event::NodeEvent,
-    get_record_handler::PendingGetRecord,
+    error::{NetworkError, Result},
+    event::{NetworkEvent, NodeEvent},
     multiaddr_pop_p2p,
     network_discovery::NetworkDiscovery,
     record_store::{ClientRecordStore, NodeRecordStore, NodeRecordStoreConfig},
     record_store_api::UnifiedRecordStore,
+    relay_manager::RelayManager,
     replication_fetcher::ReplicationFetcher,
-    Network, CLOSE_GROUP_SIZE,
+    target_arch::{interval, spawn, Instant},
+    GetRecordError, Network, CLOSE_GROUP_SIZE,
 };
+use crate::{transport, NodeIssue};
+use futures::future::Either;
 use futures::StreamExt;
-#[cfg(all(not(feature = "websockets"), not(target_arch = "wasm32")))]
-use libp2p::core::muxing::StreamMuxerBox;
 #[cfg(feature = "local-discovery")]
 use libp2p::mdns;
-// default transports
-#[cfg(all(not(feature = "websockets"), not(target_arch = "wasm32")))]
-use libp2p::quic::{tokio::Transport as TokioTransport, Config as TransportConfig};
-
-#[cfg(all(not(target_arch = "wasm32"), feature = "websockets"))]
-use libp2p::websocket::WsConfig;
-
-use crate::target_arch::{interval, spawn, Instant};
-#[cfg(all(not(target_arch = "wasm32"), feature = "websockets"))]
-use libp2p::tcp::{tokio::Transport as TokioTransport, Config as TransportConfig};
-#[cfg(target_arch = "wasm32")]
-use libp2p::websocket_websys::Transport as WebSocketTransport;
+use libp2p::Transport as _;
+use libp2p::{core::muxing::StreamMuxerBox, relay};
 use libp2p::{
     identity::Keypair,
     kad::{self, QueryId, Quorum, Record, K_VALUE},
     multiaddr::Protocol,
     request_response::{self, Config as RequestResponseConfig, OutboundRequestId, ProtocolSupport},
     swarm::{
-        behaviour::toggle::Toggle,
         dial_opts::{DialOpts, PeerCondition},
         ConnectionId, DialError, NetworkBehaviour, StreamProtocol, Swarm,
     },
-    Multiaddr, PeerId, Transport,
+    Multiaddr, PeerId,
 };
 #[cfg(feature = "open-metrics")]
 use prometheus_client::registry::Registry;
 use sn_protocol::{
     messages::{ChunkProof, Nonce, Request, Response},
     storage::RetryStrategy,
+    version::{
+        IDENTIFY_CLIENT_VERSION_STR, IDENTIFY_NODE_VERSION_STR, IDENTIFY_PROTOCOL_STR,
+        REQ_RESPONSE_VERSION_STR,
+    },
     NetworkAddress, PrettyPrintKBucketKey, PrettyPrintRecordKey,
 };
+use sn_transfers::PaymentQuote;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     net::SocketAddr,
     num::NonZeroUsize,
     path::PathBuf,
+    sync::Arc,
 };
-use tiny_keccak::{Hasher, Sha3};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 use tracing::warn;
+use xor_name::XorName;
+
+/// Interval over which we check for the farthest record we _should_ be holding
+/// based upon our knowledge of the CLOSE_GROUP
+pub(crate) const CLOSET_RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Interval over which we query relay manager to check if we can make any more reservations.
+pub(crate) const RELAY_MANAGER_RESERVATION_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The ways in which the Get Closest queries are used.
 pub(crate) enum PendingGetClosestType {
@@ -83,6 +85,17 @@ pub(crate) enum PendingGetClosestType {
 }
 type PendingGetClosest = HashMap<QueryId, (PendingGetClosestType, Vec<PeerId>)>;
 
+/// Using XorName to differentiate different record content under the same key.
+type GetRecordResultMap = HashMap<XorName, (Record, HashSet<PeerId>)>;
+pub(crate) type PendingGetRecord = HashMap<
+    QueryId,
+    (
+        oneshot::Sender<std::result::Result<Record, GetRecordError>>,
+        GetRecordResultMap,
+        GetRecordCfg,
+    ),
+>;
+
 /// What is the largest packet to send over the network.
 /// Records larger than this will be rejected.
 // TODO: revisit once cashnote_redemption is in
@@ -93,32 +106,10 @@ const REQUEST_TIMEOUT_DEFAULT_S: Duration = Duration::from_secs(30);
 // Sets the keep-alive timeout of idle connections.
 const CONNECTION_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The suffix is the version of the node.
-const SN_NODE_VERSION_STR: &str = concat!("safe/node/", env!("CARGO_PKG_VERSION"));
-/// / first version for the req/response protocol
-const REQ_RESPONSE_VERSION_STR: &str = concat!("/safe/node/", env!("CARGO_PKG_VERSION"));
-
-/// The suffix is the version of the client.
-const IDENTIFY_CLIENT_VERSION_STR: &str = concat!("safe/client/", env!("CARGO_PKG_VERSION"));
-const IDENTIFY_PROTOCOL_STR: &str = concat!("safe/", env!("CARGO_PKG_VERSION"));
-
 const NETWORKING_CHANNEL_SIZE: usize = 10_000;
 
 /// Time before a Kad query times out if no response is received
 const KAD_QUERY_TIMEOUT_S: Duration = Duration::from_secs(10);
-
-// Protocol support shall be downward compatible for patch only version update.
-// i.e. versions of `A.B.X` shall be considered as a same protocol of `A.B`
-pub(crate) fn truncate_patch_version(full_str: &str) -> &str {
-    if full_str.matches('.').count() == 2 {
-        match full_str.rfind('.') {
-            Some(pos) => &full_str[..pos],
-            None => full_str,
-        }
-    } else {
-        full_str
-    }
-}
 
 /// The various settings to apply to when fetching a record from network
 #[derive(Clone)]
@@ -196,18 +187,21 @@ pub(super) struct NodeBehaviour {
     #[cfg(feature = "local-discovery")]
     pub(super) mdns: mdns::tokio::Behaviour,
     pub(super) identify: libp2p::identify::Behaviour,
-    pub(super) gossipsub: Toggle<libp2p::gossipsub::Behaviour>,
+    pub(super) dcutr: libp2p::dcutr::Behaviour,
+    pub(super) relay_client: libp2p::relay::client::Behaviour,
+    pub(super) relay_server: libp2p::relay::Behaviour,
 }
 
 #[derive(Debug)]
 pub struct NetworkBuilder {
+    is_behind_home_network: bool,
     keypair: Keypair,
     local: bool,
     root_dir: PathBuf,
     listen_addr: Option<SocketAddr>,
-    enable_gossip: bool,
     request_timeout: Option<Duration>,
     concurrency_limit: Option<usize>,
+    initial_peers: Vec<Multiaddr>,
     #[cfg(feature = "open-metrics")]
     metrics_registry: Option<Registry>,
     #[cfg(feature = "open-metrics")]
@@ -217,13 +211,14 @@ pub struct NetworkBuilder {
 impl NetworkBuilder {
     pub fn new(keypair: Keypair, local: bool, root_dir: PathBuf) -> Self {
         Self {
+            is_behind_home_network: false,
             keypair,
             local,
             root_dir,
             listen_addr: None,
-            enable_gossip: false,
             request_timeout: None,
             concurrency_limit: None,
+            initial_peers: Default::default(),
             #[cfg(feature = "open-metrics")]
             metrics_registry: None,
             #[cfg(feature = "open-metrics")]
@@ -231,13 +226,12 @@ impl NetworkBuilder {
         }
     }
 
-    pub fn listen_addr(&mut self, listen_addr: SocketAddr) {
-        self.listen_addr = Some(listen_addr);
+    pub fn is_behind_home_network(&mut self, enable: bool) {
+        self.is_behind_home_network = enable;
     }
 
-    /// Enable gossip for the network
-    pub fn enable_gossip(&mut self) {
-        self.enable_gossip = true;
+    pub fn listen_addr(&mut self, listen_addr: SocketAddr) {
+        self.listen_addr = Some(listen_addr);
     }
 
     pub fn request_timeout(&mut self, request_timeout: Duration) {
@@ -246,6 +240,10 @@ impl NetworkBuilder {
 
     pub fn concurrency_limit(&mut self, concurrency_limit: usize) {
         self.concurrency_limit = Some(concurrency_limit);
+    }
+
+    pub fn initial_peers(&mut self, initial_peers: Vec<Multiaddr>) {
+        self.initial_peers = initial_peers;
     }
 
     #[cfg(feature = "open-metrics")]
@@ -286,7 +284,8 @@ impl NetworkBuilder {
             .set_max_packet_size(MAX_PACKET_SIZE)
             // How many nodes _should_ store data.
             .set_replication_factor(
-                NonZeroUsize::new(CLOSE_GROUP_SIZE).ok_or_else(|| Error::InvalidCloseGroupSize)?,
+                NonZeroUsize::new(CLOSE_GROUP_SIZE)
+                    .ok_or_else(|| NetworkError::InvalidCloseGroupSize)?,
             )
             .set_query_timeout(KAD_QUERY_TIMEOUT_S)
             // Require iterative queries to use disjoint paths for increased resiliency in the presence of potentially adversarial nodes.
@@ -303,7 +302,7 @@ impl NetworkBuilder {
             // Configures the disk_store to store records under the provided path and increase the max record size
             let storage_dir_path = self.root_dir.join("record_store");
             if let Err(error) = std::fs::create_dir_all(&storage_dir_path) {
-                return Err(Error::FailedToCreateRecordStoreDir {
+                return Err(NetworkError::FailedToCreateRecordStoreDir {
                     path: storage_dir_path,
                     source: error,
                 });
@@ -322,30 +321,30 @@ impl NetworkBuilder {
             Some(store_cfg),
             false,
             ProtocolSupport::Full,
-            truncate_patch_version(SN_NODE_VERSION_STR).to_string(),
+            IDENTIFY_NODE_VERSION_STR.to_string(),
         )?;
 
         // Listen on the provided address
-        let listen_socket_addr = listen_addr.ok_or(Error::ListenAddressNotProvided)?;
+        let listen_socket_addr = listen_addr.ok_or(NetworkError::ListenAddressNotProvided)?;
 
-        // Flesh out the multiaddress
-        let start_addr = Multiaddr::from(listen_socket_addr.ip());
+        // Listen on QUIC
+        let addr_quic = Multiaddr::from(listen_socket_addr.ip())
+            .with(Protocol::Udp(listen_socket_addr.port()))
+            .with(Protocol::QuicV1);
+        swarm_driver
+            .listen_on(addr_quic)
+            .expect("Multiaddr should be supported by our configured transports");
 
-        let listen_addr = if cfg!(any(feature = "websockets", target_arch = "wasm32")) {
-            start_addr
+        // Listen on WebSocket
+        #[cfg(any(feature = "websockets", target_arch = "wasm32"))]
+        {
+            let addr_ws = Multiaddr::from(listen_socket_addr.ip())
                 .with(Protocol::Tcp(listen_socket_addr.port()))
-                .with(Protocol::Ws("/".into()))
-        } else {
-            start_addr
-                .with(Protocol::Udp(listen_socket_addr.port()))
-                .with(Protocol::QuicV1)
-        };
-
-        debug!("Attempting to listen on: {listen_addr:?}");
-        let _listener_id = swarm_driver
-            .swarm
-            .listen_on(listen_addr)
-            .expect("Failed to listen on the provided address");
+                .with(Protocol::Ws("/".into()));
+            swarm_driver
+                .listen_on(addr_ws)
+                .expect("Multiaddr should be supported by our configured transports");
+        }
 
         Ok((network, events_receiver, swarm_driver))
     }
@@ -358,12 +357,14 @@ impl NetworkBuilder {
 
         // 1mb packet size
         let _ = kad_cfg
+            .set_kbucket_inserts(libp2p::kad::BucketInserts::Manual)
             .set_max_packet_size(MAX_PACKET_SIZE)
             // Require iterative queries to use disjoint paths for increased resiliency in the presence of potentially adversarial nodes.
             .disjoint_query_paths(true)
             // How many nodes _should_ store data.
             .set_replication_factor(
-                NonZeroUsize::new(CLOSE_GROUP_SIZE).ok_or_else(|| Error::InvalidCloseGroupSize)?,
+                NonZeroUsize::new(CLOSE_GROUP_SIZE)
+                    .ok_or_else(|| NetworkError::InvalidCloseGroupSize)?,
             );
 
         let (network, net_event_recv, driver) = self.build(
@@ -371,7 +372,7 @@ impl NetworkBuilder {
             None,
             true,
             ProtocolSupport::Outbound,
-            truncate_patch_version(IDENTIFY_CLIENT_VERSION_STR).to_string(),
+            IDENTIFY_CLIENT_VERSION_STR.to_string(),
         )?;
 
         Ok((network, net_event_recv, driver))
@@ -411,9 +412,13 @@ impl NetworkBuilder {
             let cfg = RequestResponseConfig::default()
                 .with_request_timeout(self.request_timeout.unwrap_or(REQUEST_TIMEOUT_DEFAULT_S));
 
+            info!(
+                "Building request response with {:?}",
+                REQ_RESPONSE_VERSION_STR.as_str()
+            );
             request_response::cbor::Behaviour::new(
                 [(
-                    StreamProtocol::new(truncate_patch_version(REQ_RESPONSE_VERSION_STR)),
+                    StreamProtocol::new(&REQ_RESPONSE_VERSION_STR),
                     req_res_protocol,
                 )],
                 cfg,
@@ -462,81 +467,15 @@ impl NetworkBuilder {
         let mdns = mdns::tokio::Behaviour::new(mdns_config, peer_id)?;
 
         // Identify Behaviour
+        let identify_protocol_str = IDENTIFY_PROTOCOL_STR.to_string();
+        info!("Building Identify with identify_protocol_str: {identify_protocol_str:?} and identify_version: {identify_version:?}");
         let identify = {
-            let cfg = libp2p::identify::Config::new(
-                truncate_patch_version(IDENTIFY_PROTOCOL_STR).to_string(),
-                self.keypair.public(),
-            )
-            .with_agent_version(identify_version);
+            let cfg = libp2p::identify::Config::new(identify_protocol_str, self.keypair.public())
+                .with_agent_version(identify_version);
             libp2p::identify::Behaviour::new(cfg)
         };
 
-        // Default quic transport.
-        // cannot be built for wasm32
-        #[cfg(all(not(feature = "websockets"), not(target_arch = "wasm32")))]
-        let main_transport = TokioTransport::new(TransportConfig::new(&self.keypair))
-            .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
-            .boxed();
-
-        #[cfg(target_arch = "wasm32")]
-        let main_transport = WebSocketTransport::default()
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(
-                libp2p::noise::Config::new(&self.keypair)
-                    .expect("Signing libp2p-noise static DH keypair failed."),
-            )
-            .multiplex(libp2p::yamux::Config::default())
-            .boxed();
-
-        #[cfg(all(not(target_arch = "wasm32"), feature = "websockets"))]
-        let tcp = TokioTransport::new(TransportConfig::default());
-
-        // tcp websocket transport for node builds
-        #[cfg(all(not(target_arch = "wasm32"), feature = "websockets"))]
-        let main_transport = WsConfig::new(tcp)
-            .upgrade(libp2p::core::upgrade::Version::V1)
-            .authenticate(
-                libp2p::noise::Config::new(&self.keypair)
-                    .expect("Signing libp2p-noise static DH keypair failed."),
-            )
-            .multiplex(libp2p::yamux::Config::default())
-            .boxed();
-
-        let gossipsub = if self.enable_gossip {
-            // Gossipsub behaviour
-            let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
-                // we don't currently require source peer id and/or signing
-                .validation_mode(libp2p::gossipsub::ValidationMode::Permissive)
-                // we use the hash of the msg content as the msg id to deduplicate them
-                .message_id_fn(|msg| {
-                    let mut sha3 = Sha3::v256();
-                    let mut msg_id = [0; 32];
-                    sha3.update(&msg.data);
-                    sha3.finalize(&mut msg_id);
-                    msg_id.into()
-                })
-                // set the heartbeat interval to be higher than default 1sec
-                .heartbeat_interval(Duration::from_secs(5))
-                // default is 3sec, increase to 10sec to avoid false alert
-                .iwant_followup_time(Duration::from_secs(10))
-                // default is 10sec, increase to 60sec to reduce the risk of looping
-                .published_message_ids_cache_time(Duration::from_secs(60))
-                .build()
-                .map_err(|err| Error::GossipsubConfigError(err.to_string()))?;
-
-            // Set the message authenticity
-            let message_authenticity = libp2p::gossipsub::MessageAuthenticity::Anonymous;
-
-            // build a gossipsub network behaviour
-            let gossipsub: libp2p::gossipsub::Behaviour =
-                libp2p::gossipsub::Behaviour::new(message_authenticity, gossipsub_config)
-                    .expect("Failed to instantiate Gossipsub behaviour.");
-            Some(gossipsub)
-        } else {
-            None
-        };
-
-        let gossipsub = Toggle::from(gossipsub);
+        let main_transport = transport::build_transport(&self.keypair);
 
         let transport = if !self.local {
             debug!("Preventing non-global dials");
@@ -546,13 +485,43 @@ impl NetworkBuilder {
             main_transport
         };
 
+        let (relay_transport, relay_behaviour) =
+            libp2p::relay::client::new(self.keypair.public().to_peer_id());
+        let relay_transport = relay_transport
+            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+            .authenticate(
+                libp2p::noise::Config::new(&self.keypair)
+                    .expect("Signing libp2p-noise static DH keypair failed."),
+            )
+            .multiplex(libp2p::yamux::Config::default())
+            .or_transport(transport);
+
+        let transport = relay_transport
+            .map(|either_output, _| match either_output {
+                Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+                Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            })
+            .boxed();
+
+        let relay_server = {
+            let relay_server_cfg = relay::Config {
+                max_reservations: 1024,      // the number of home nodes that we can support
+                max_circuits: 32_000, // total max number of relayed connections we can support
+                max_circuits_per_peer: 1024, // max number of relayed connections per peer
+                ..Default::default()
+            };
+            libp2p::relay::Behaviour::new(peer_id, relay_server_cfg)
+        };
+
         let behaviour = NodeBehaviour {
+            relay_client: relay_behaviour,
+            relay_server,
             request_response,
             kademlia,
             identify,
             #[cfg(feature = "local-discovery")]
             mdns,
-            gossipsub,
+            dcutr: libp2p::dcutr::Behaviour::new(peer_id),
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -566,14 +535,21 @@ impl NetworkBuilder {
 
         let bootstrap = ContinuousBootstrap::new();
         let replication_fetcher = ReplicationFetcher::new(peer_id, network_event_sender.clone());
+        let mut relay_manager = RelayManager::new(self.initial_peers, peer_id);
+        if !is_client {
+            relay_manager.enable_hole_punching(self.is_behind_home_network);
+        }
 
         let swarm_driver = SwarmDriver {
             swarm,
             self_peer_id: peer_id,
             local: self.local,
+            listen_port: self.listen_addr.map(|addr| addr.port()),
             is_client,
+            is_behind_home_network: self.is_behind_home_network,
             connected_peers: 0,
             bootstrap,
+            relay_manager,
             close_group: Default::default(),
             replication_fetcher,
             #[cfg(feature = "open-metrics")]
@@ -586,7 +562,6 @@ impl NetworkBuilder {
             // We use 255 here which allows covering a network larger than 64k without any rotating.
             // This is based on the libp2p kad::kBuckets peers distribution.
             dialed_peers: CircularVec::new(255),
-            is_gossip_handler: false,
             network_discovery: NetworkDiscovery::new(&peer_id),
             bootstrap_peers: Default::default(),
             live_connected_peers: Default::default(),
@@ -595,14 +570,15 @@ impl NetworkBuilder {
             hard_disk_write_error: 0,
             bad_nodes: Default::default(),
             bad_nodes_ongoing_verifications: Default::default(),
+            quotes_history: Default::default(),
         };
 
         Ok((
             Network {
                 swarm_cmd_sender,
-                peer_id,
-                root_dir_path: self.root_dir,
-                keypair: self.keypair,
+                peer_id: Arc::new(peer_id),
+                root_dir_path: Arc::new(self.root_dir),
+                keypair: Arc::new(self.keypair),
             },
             network_event_receiver,
             swarm_driver,
@@ -613,10 +589,15 @@ impl NetworkBuilder {
 pub struct SwarmDriver {
     pub(crate) swarm: Swarm<NodeBehaviour>,
     pub(crate) self_peer_id: PeerId,
+    /// When true, we don't filter our local addresses
     pub(crate) local: bool,
     pub(crate) is_client: bool,
+    pub(crate) is_behind_home_network: bool,
+    /// The port that was set by the user
+    pub(crate) listen_port: Option<u16>,
     pub(crate) connected_peers: usize,
     pub(crate) bootstrap: ContinuousBootstrap,
+    pub(crate) relay_manager: RelayManager,
     /// The peers that are closer to our PeerId. Includes self.
     pub(crate) close_group: Vec<PeerId>,
     pub(crate) replication_fetcher: ReplicationFetcher,
@@ -632,12 +613,8 @@ pub struct SwarmDriver {
     pub(crate) pending_requests:
         HashMap<OutboundRequestId, Option<oneshot::Sender<Result<Response>>>>,
     pub(crate) pending_get_record: PendingGetRecord,
-    /// A list of the most recent peers we have dialed ourselves.
+    /// A list of the most recent peers we have dialed ourselves. Old dialed peers are evicted once the vec fills up.
     pub(crate) dialed_peers: CircularVec<PeerId>,
-    // For normal nodes, though they subscribe to the gossip topic
-    // (to ensure no miss-up by carrying out libp2p low level gossip forwarding),
-    // they are not supposed to process the gossip msg that received from libp2p.
-    pub(crate) is_gossip_handler: bool,
     // A list of random `PeerId` candidates that falls into kbuckets,
     // This is to ensure a more accurate network discovery.
     pub(crate) network_discovery: NetworkDiscovery,
@@ -649,8 +626,11 @@ pub struct SwarmDriver {
     handling_statistics: BTreeMap<String, Vec<Duration>>,
     handled_times: usize,
     pub(crate) hard_disk_write_error: usize,
-    pub(crate) bad_nodes: BTreeSet<PeerId>,
+    // 10 is the max number of issues per node we track to avoid mem leaks
+    // the boolean flag to indicate whether the node is considered as bad or not
+    pub(crate) bad_nodes: BTreeMap<PeerId, (Vec<(NodeIssue, Instant)>, bool)>,
     pub(crate) bad_nodes_ongoing_verifications: BTreeSet<PeerId>,
+    pub(crate) quotes_history: BTreeMap<PeerId, PaymentQuote>,
 }
 
 impl SwarmDriver {
@@ -663,11 +643,14 @@ impl SwarmDriver {
     /// asynchronous tasks.
     pub async fn run(mut self) {
         let mut bootstrap_interval = interval(BOOTSTRAP_INTERVAL);
+        let mut set_farthest_record_interval = interval(CLOSET_RECORD_CHECK_INTERVAL);
+        let mut relay_manager_reservation_interval = interval(RELAY_MANAGER_RESERVATION_INTERVAL);
+
         loop {
             tokio::select! {
                 swarm_event = self.swarm.select_next_some() => {
                     // logging for handling events happens inside handle_swarm_events
-                    // otherwise we're rewriting match statements etc around this anwyay
+                    // otherwise we're rewriting match statements etc around this anyway
                     if let Err(err) = self.handle_swarm_events(swarm_event) {
                         warn!("Error while handling swarm event: {err}");
                     }
@@ -689,6 +672,21 @@ impl SwarmDriver {
                         bootstrap_interval = new_interval;
                     }
                 }
+                _ = set_farthest_record_interval.tick() => {
+                    if !self.is_client {
+                        let closest_k_peers = self.get_closest_k_value_local_peers();
+
+                        if let Some(distance) = self.get_farthest_data_address_estimate(&closest_k_peers) {
+                            // set any new distance to farthest record in the store
+                            self.swarm.behaviour_mut().kademlia.store_mut().set_distance_range(distance);
+
+                            let replication_distance = self.swarm.behaviour_mut().kademlia.store_mut().get_farthest_replication_distance_bucket().unwrap_or(1);
+                            // the distance range within the replication_fetcher shall be in sync as well
+                            self.replication_fetcher.set_replication_distance_range(replication_distance);
+                        }
+                    }
+                }
+                _ = relay_manager_reservation_interval.tick() => self.relay_manager.try_connecting_to_relay(&mut self.swarm),
             }
         }
     }
@@ -696,6 +694,31 @@ impl SwarmDriver {
     // --------------------------------------------
     // ---------- Crate helpers -------------------
     // --------------------------------------------
+
+    /// Returns the farthest bucket, close to but probably farther than our responsibilty range.
+    /// This simply uses the closest k peers to estimate the farthest address as
+    /// `K_VALUE`th peer's bucket.
+    fn get_farthest_data_address_estimate(
+        &mut self,
+        // Sorted list of closest k peers to our peer id.
+        closest_k_peers: &[PeerId],
+    ) -> Option<u32> {
+        // if we don't have enough peers we don't set the distance range yet.
+        let mut farthest_distance = None;
+
+        let our_address = NetworkAddress::from_peer(self.self_peer_id);
+
+        // get K_VALUEth peer's address distance
+        // This is a rough estimate of the farthest address we might be responsible for.
+        // We want this to be higher than actually necessary, so we retain more data
+        // and can be sure to pass bad node checks
+        if let Some(peer) = closest_k_peers.last() {
+            let address = NetworkAddress::from_peer(*peer);
+            farthest_distance = our_address.distance(&address).ilog2();
+        }
+
+        farthest_distance
+    }
 
     /// Sends an event after pushing it off thread so as to be non-blocking
     /// this is a wrapper around the `mpsc::Sender::send` call
@@ -814,5 +837,12 @@ impl SwarmDriver {
             // now we've logged, lets clear the stats from the btreemap
             self.handling_statistics.clear();
         }
+    }
+
+    /// Listen on the provided address. Also records it within RelayManager
+    pub(crate) fn listen_on(&mut self, addr: Multiaddr) -> Result<()> {
+        let id = self.swarm.listen_on(addr.clone())?;
+        info!("Listening on {id:?} with addr: {addr:?}");
+        Ok(())
     }
 }

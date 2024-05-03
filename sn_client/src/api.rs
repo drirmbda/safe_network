@@ -7,14 +7,11 @@
 // permissions and limitations relating to use of the SAFE Network Software.
 
 use super::{
-    chunks::Error as ChunksError,
     error::{Error, Result},
     Client, ClientEvent, ClientEventsBroadcaster, ClientEventsReceiver, ClientRegister,
     WalletClient,
 };
 use bls::{PublicKey, SecretKey, Signature};
-use bytes::Bytes;
-use futures::future::join_all;
 use libp2p::{
     identity::Keypair,
     kad::{Quorum, Record},
@@ -24,10 +21,10 @@ use libp2p::{
 use prometheus_client::registry::Registry;
 use rand::{thread_rng, Rng};
 use sn_networking::{
-    multiaddr_is_global,
+    get_signed_spend_from_record, multiaddr_is_global,
     target_arch::{interval, spawn, timeout, Instant},
-    Error as NetworkError, GetRecordCfg, GetRecordError, NetworkBuilder, NetworkEvent,
-    PutRecordCfg, VerificationKind, CLOSE_GROUP_SIZE,
+    GetRecordCfg, GetRecordError, NetworkBuilder, NetworkError, NetworkEvent, PutRecordCfg,
+    VerificationKind, CLOSE_GROUP_SIZE,
 };
 use sn_protocol::{
     error::Error as ProtocolError,
@@ -39,11 +36,15 @@ use sn_protocol::{
     NetworkAddress, PrettyPrintRecordKey,
 };
 use sn_registers::{Permissions, SignedRegister};
-use sn_transfers::{CashNote, CashNoteRedemption, MainPubkey, NanoTokens, Payment, SignedSpend};
+use sn_transfers::{
+    CashNote, CashNoteRedemption, MainPubkey, NanoTokens, Payment, SignedSpend, TransferError,
+};
+#[cfg(target_arch = "wasm32")]
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    path::PathBuf,
+    sync::Arc,
 };
 use tokio::time::Duration;
 use tracing::trace;
@@ -56,20 +57,20 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Client {
-    /// A quick client that only takes some peers to connect to
+    /// A quick client with a random secret key and some peers.
     pub async fn quick_start(peers: Option<Vec<Multiaddr>>) -> Result<Self> {
-        Self::new(SecretKey::random(), peers, false, None, None).await
+        Self::new(SecretKey::random(), peers, None, None).await
     }
 
     /// Instantiate a new client.
     ///
-    /// Optionally specify the maximum time the client will wait for a connection to the network before timing out.
+    /// Optionally specify the duration for the connection timeout.
+    ///
     /// Defaults to 180 seconds.
     ///
     /// # Arguments
     /// * 'signer' - [SecretKey]
     /// * 'peers' - [Option]<[Vec]<[Multiaddr]>>
-    /// * 'enable_gossip' - Boolean: Signifies whether the client should attempt to join the gossip layer in the network. i.e to monitor network royalties.
     /// * 'connection_timeout' - [Option]<[Duration]> : Specification for client connection timeout set via Optional
     /// * 'client_event_broadcaster' - [Option]<[ClientEventsBroadcaster]>
     ///
@@ -79,14 +80,13 @@ impl Client {
     /// use bls::SecretKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn new(
         signer: SecretKey,
         peers: Option<Vec<Multiaddr>>,
-        enable_gossip: bool,
         connection_timeout: Option<Duration>,
         client_event_broadcaster: Option<ClientEventsBroadcaster>,
     ) -> Result<Self> {
@@ -105,12 +105,13 @@ impl Client {
         let root_dir = std::env::temp_dir();
         trace!("Starting Kad swarm in client mode..{root_dir:?}.");
 
+        // TODO: shall client bearing owner's discord user name, to be reflected in the cash_notes?
+
+        #[cfg(not(feature = "open-metrics"))]
+        let network_builder = NetworkBuilder::new(Keypair::generate_ed25519(), local, root_dir);
+
+        #[cfg(feature = "open-metrics")]
         let mut network_builder = NetworkBuilder::new(Keypair::generate_ed25519(), local, root_dir);
-
-        if enable_gossip {
-            network_builder.enable_gossip();
-        }
-
         #[cfg(feature = "open-metrics")]
         network_builder.metrics_registry(Registry::default());
 
@@ -124,7 +125,7 @@ impl Client {
         let client = Self {
             network: network.clone(),
             events_broadcaster,
-            signer,
+            signer: Arc::new(signer),
         };
 
         // subscribe to our events channel first, so we don't have intermittent
@@ -192,7 +193,9 @@ impl Client {
         // loop to connect to the network
         let mut is_connected = false;
         let connection_timeout = connection_timeout.unwrap_or(CONNECTION_TIMEOUT);
+        let mut unsupported_protocol_tracker: Option<(String, String)> = None;
 
+        debug!("Client connection timeout: {connection_timeout:?}");
         let mut connection_timeout_interval = interval(connection_timeout);
         // first tick completes immediately
         connection_timeout_interval.tick().await;
@@ -201,16 +204,26 @@ impl Client {
             tokio::select! {
             _ = connection_timeout_interval.tick() => {
                 if !is_connected {
+                    if let Some((our_protocol, their_protocols)) = unsupported_protocol_tracker {
+                        error!("Timeout: Client could not connect to the network as it does not support the protocol");
+                        break Err(Error::UnsupportedProtocol(our_protocol, their_protocols));
+                    }
                     error!("Timeout: Client failed to connect to the network within {connection_timeout:?}");
-                    return Err(Error::ConnectionTimeout(connection_timeout));
+                    break Err(Error::ConnectionTimeout(connection_timeout));
                 }
             }
             event = client_events_rx.recv() => {
                 match event {
+                    // we do not error out directly as we might still connect if the other initial peers are from
+                    // the correct network.
+                    Ok(ClientEvent::PeerWithUnsupportedProtocol { our_protocol, their_protocol }) => {
+                        warn!(%our_protocol, %their_protocol, "Client tried to connect to a peer with an unsupported protocol. Tracking the latest one");
+                        unsupported_protocol_tracker = Some((our_protocol, their_protocol));
+                    }
                     Ok(ClientEvent::ConnectedToNetwork) => {
                         is_connected = true;
                         info!("Client connected to the Network {is_connected:?}.");
-                        break;
+                        break Ok(());
                     }
                     Ok(ClientEvent::InactiveClient(timeout)) => {
                         if is_connected {
@@ -222,12 +235,12 @@ impl Client {
                     Err(err) => {
                         error!("Unexpected error during client startup {err:?}");
                         println!("Unexpected error during client startup {err:?}");
-                        return Err(err.into());
+                        break Err(err.into());
                     }
                     _ => {}
                 }
             }}
-        }
+        }?;
 
         Ok(client)
     }
@@ -253,10 +266,15 @@ impl Client {
                     debug!("{peers_added}/{CLOSE_GROUP_SIZE} initial peers found.",);
                 }
             }
-            NetworkEvent::GossipsubMsgReceived { topic, msg }
-            | NetworkEvent::GossipsubMsgPublished { topic, msg } => {
+            NetworkEvent::PeerWithUnsupportedProtocol {
+                our_protocol,
+                their_protocol,
+            } => {
                 self.events_broadcaster
-                    .broadcast(ClientEvent::GossipsubMsg { topic, msg });
+                    .broadcast(ClientEvent::PeerWithUnsupportedProtocol {
+                        our_protocol,
+                        their_protocol,
+                    });
             }
             _other => {}
         }
@@ -276,15 +294,13 @@ impl Client {
     /// use bls::SecretKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Using client.events_channel() to publish messages
     /// let mut events_channel = client.events_channel();
     /// while let Ok(event) = events_channel.recv().await {
-    ///     if let ClientEvent::GossipsubMsg { msg, .. } = event {
-    ///     let msg = String::from_utf8(msg.to_vec()).unwrap();
-    ///     println!("New message published: {msg}");
-    ///     }
-    /// }
+    /// // Handle the event
+    ///  }
+    ///
     /// # Ok(())
     /// # }
     /// ```
@@ -312,7 +328,7 @@ impl Client {
     /// use xor_name::XorName;
     /// use sn_registers::Register;
     /// use sn_protocol::messages::RegisterCmd;
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     ///
     /// // Set up register prerequisites
     /// let mut rng = rand::thread_rng();
@@ -348,7 +364,7 @@ impl Client {
     /// use bls::SecretKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// let secret_key_reference = client.signer();
     /// # Ok(())
     /// # }
@@ -369,13 +385,33 @@ impl Client {
     /// use bls::SecretKey;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// let public_key_reference = client.signer_pk();
     /// # Ok(())
     /// # }
     /// ```
     pub fn signer_pk(&self) -> PublicKey {
         self.signer.public_key()
+    }
+
+    /// Set the signing key for this client.
+    ///
+    /// # Arguments
+    /// * 'sk' - [SecretKey]
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sn_client::{Client, Error};
+    /// use bls::SecretKey;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(),Error>{
+    /// let mut client = Client::new(SecretKey::random(), None, None, None).await?;
+    /// client.set_signer_key(SecretKey::random());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_signer_key(&mut self, sk: SecretKey) {
+        self.signer = Arc::new(sk);
     }
 
     /// Get a register from network
@@ -397,7 +433,7 @@ impl Client {
     /// use xor_name::XorName;
     /// use sn_registers::RegisterAddress;
     /// // Set up a client
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Set up an address
     /// let mut rng = rand::thread_rng();
     /// let owner = SecretKey::random().public_key();
@@ -471,7 +507,7 @@ impl Client {
     /// use xor_name::XorName;
     /// use sn_registers::RegisterAddress;
     /// // Set up a client
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Set up an address
     /// let mut rng = rand::thread_rng();
     /// let owner = SecretKey::random().public_key();
@@ -513,7 +549,7 @@ impl Client {
     /// // Set up Client, Wallet, etc
     /// use sn_registers::Permissions;
     /// use sn_transfers::HotWallet;
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client.clone(), wallet);
@@ -528,7 +564,7 @@ impl Client {
     ///             xorname,
     ///             &mut wallet_client,
     ///             true,
-    ///             Permissions::new_owner_only(),
+    ///             Permissions::default(),
     ///         )
     ///         .await?;
     /// # Ok(())
@@ -551,10 +587,10 @@ impl Client {
         )
         .await?;
 
-        debug!("{address:?} Created in theorryyyyy");
+        debug!("{address:?} Created in theory");
         let reg_address = reg.address();
         if verify_store {
-            debug!("WE SHOULD VERRRRIFYING");
+            debug!("We should verify stored at {address:?}");
             let mut stored = self.verify_register_stored(*reg_address).await.is_ok();
 
             while !stored {
@@ -573,12 +609,11 @@ impl Client {
                 total_cost = total_cost
                     .checked_add(top_up_cost)
                     .ok_or(Error::TotalPriceTooHigh)?;
-                total_royalties =
-                    total_cost
-                        .checked_add(royalties_top_up)
-                        .ok_or(Error::Transfers(sn_transfers::WalletError::from(
-                            sn_transfers::Error::ExcessiveNanoValue,
-                        )))?;
+                total_royalties = total_cost
+                    .checked_add(royalties_top_up)
+                    .ok_or(Error::Wallet(sn_transfers::WalletError::from(
+                        sn_transfers::TransferError::ExcessiveNanoValue,
+                    )))?;
                 stored = self.verify_register_stored(*reg_address).await.is_ok();
             }
         }
@@ -671,7 +706,7 @@ impl Client {
     /// use xor_name::XorName;
     /// use sn_protocol::storage::ChunkAddress;
     /// // client
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // chunk address
     /// let mut rng = rand::thread_rng();
     /// let xorname = XorName::random(&mut rng);
@@ -721,7 +756,7 @@ impl Client {
 
     /// Verify if a `Chunk` is stored by expected nodes on the network.
     /// Single local use. Marked Private.
-    async fn verify_chunk_stored(&self, chunk: &Chunk) -> Result<()> {
+    pub async fn verify_chunk_stored(&self, chunk: &Chunk) -> Result<()> {
         let address = chunk.network_address();
         info!("Verifying chunk: {address:?}");
         let random_nonce = thread_rng().gen::<u64>();
@@ -764,7 +799,7 @@ impl Client {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
     /// // Set up Client
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Set up an address
     /// let mut rng = rand::thread_rng();
     /// let owner = SecretKey::random().public_key();
@@ -778,6 +813,40 @@ impl Client {
     pub async fn verify_register_stored(&self, address: RegisterAddress) -> Result<SignedRegister> {
         info!("Verifying register: {address:?}");
         self.get_signed_register_from_network(address, true).await
+    }
+
+    /// Quickly checks if a `Register` is stored by expected nodes on the network.
+    ///
+    /// To be used for initial register put checks eg, if we expect the data _not_
+    /// to exist, we can use it and essentially use the RetryStrategy::Quick under the hood
+    ///
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sn_client::{Client, Error};
+    /// use bls::SecretKey;
+    /// use xor_name::XorName;
+    /// use sn_registers::RegisterAddress;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(),Error>{
+    /// // Set up Client
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
+    /// // Set up an address
+    /// let mut rng = rand::thread_rng();
+    /// let owner = SecretKey::random().public_key();
+    /// let xorname = XorName::random(&mut rng);
+    /// let address = RegisterAddress::new(xorname, owner);
+    /// // Verify address is stored
+    /// let is_stored = client.verify_register_stored(address).await.is_ok();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn quickly_check_if_register_stored(
+        &self,
+        address: RegisterAddress,
+    ) -> Result<SignedRegister> {
+        info!("Quickly checking for existing register : {address:?}");
+        self.get_signed_register_from_network(address, false).await
     }
 
     /// Send a `SpendCashNote` request to the network. Protected method.
@@ -850,7 +919,7 @@ impl Client {
     /// use sn_transfers::SpendAddress;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Create a SpendAddress
     /// let mut rng = rand::thread_rng();
     /// let xorname = XorName::random(&mut rng);
@@ -878,143 +947,37 @@ impl Client {
         let record = self
             .network
             .get_record_from_network(key.clone(), &get_cfg)
-            .await
-            .map_err(|err| match err {
-                sn_networking::Error::GetRecordError(GetRecordError::RecordNotFound) => {
-                    Error::MissingSpendRecord(address)
-                }
-                _ => Error::CouldNotVerifyTransfer(format!(
-                    "failed to get spend at {address:?}: {err:?}"
-                )),
-            })?;
+            .await?;
         info!(
             "For spend at {address:?} got record from the network, {:?}",
             PrettyPrintRecordKey::from(&record.key)
         );
 
-        let header = RecordHeader::from_record(&record).map_err(|err| {
-            Error::CouldNotVerifyTransfer(format!(
-                "Can't parse RecordHeader for the spend at {address:?} with error {err:?}"
-            ))
-        })?;
+        let signed_spend = get_signed_spend_from_record(&address, &record)?;
 
-        if let RecordKind::Spend = header.kind {
-            let mut deserialized_record = try_deserialize_record::<Vec<SignedSpend>>(&record)
-                .map_err(|err| {
-                    Error::CouldNotVerifyTransfer(format!(
-                        "Can't deserialize record for the spend at {address:?} with error {err:?}"
-                    ))
-                })?;
-
-            match deserialized_record.len() {
-                0 => {
-                    trace!("Found no spend for {address:?}");
-                    Err(Error::CouldNotVerifyTransfer(format!(
-                        "Fetched record shows no spend for cash_note {address:?}."
-                    )))
-                }
-                1 => {
-                    let signed_spend = deserialized_record.remove(0);
-                    trace!("Spend get for address: {address:?} successful");
-                    if address == SpendAddress::from_unique_pubkey(signed_spend.unique_pubkey()) {
-                        match signed_spend.verify(signed_spend.spent_tx_hash()) {
-                            Ok(_) => {
-                                trace!("Verified signed spend got from network for {address:?}");
-                                Ok(signed_spend)
-                            }
-                            Err(err) => {
-                                warn!("Invalid signed spend got from network for {address:?}: {err:?}.");
-                                Err(Error::CouldNotVerifyTransfer(format!(
-                                "Spend failed verifiation for the unique_pubkey {address:?} with error {err:?}")))
-                            }
-                        }
-                    } else {
-                        warn!("Signed spend ({:?}) got from network mismatched the expected one {address:?}.", signed_spend.unique_pubkey());
-                        Err(Error::CouldNotVerifyTransfer(format!(
-                                "Signed spend ({:?}) got from network mismatched the expected one {address:?}.", signed_spend.unique_pubkey())))
-                    }
-                }
-                _ => {
-                    // each one is 0 as it shifts remaining elements
-                    let one = deserialized_record.remove(0);
-                    let two = deserialized_record.remove(0);
-                    error!("Found double spend for {address:?}");
-                    Err(Error::DoubleSpend(address, Box::new(one), Box::new(two)))
-                }
-            }
-        } else {
-            error!("RecordKind mismatch while trying to retrieve a cash_note spend");
-            Err(NetworkError::RecordKindMismatch(RecordKind::Spend).into())
+        // check addr
+        let spend_addr = SpendAddress::from_unique_pubkey(signed_spend.unique_pubkey());
+        if address != spend_addr {
+            let s = format!("Spend got from the Network at {address:?} contains different spend address: {spend_addr:?}");
+            warn!("{s}");
+            return Err(Error::Transfer(TransferError::InvalidSpendValue(
+                *signed_spend.unique_pubkey(),
+            )));
         }
-    }
 
-    /// Subscribe to given gossipsub topic
-    ///
-    /// # Arguments
-    /// * 'topic_id' - [String]
-    ///
-    /// # Example
-    /// ```no_run
-    /// use sn_client::{Client, Error};
-    /// use bls::SecretKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
-    /// // Subscribing to the gossipsub topic "Royalty Transfer Notification"
-    /// client.subscribe_to_topic(String::from("ROYALTY_TRANSFER_NOTIFICATION"));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn subscribe_to_topic(&self, topic_id: String) {
-        info!("Subscribing to topic id: {topic_id}");
-        self.network.subscribe_to_topic(topic_id);
-        self.network.start_handle_gossip();
-    }
-
-    /// Unsubscribe from given gossipsub topic
-    ///
-    /// # Arguments
-    /// * 'topic_id' - [String]
-    ///
-    /// # Example
-    /// ```no_run
-    /// use sn_client::{Client, Error};
-    /// use bls::SecretKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
-    /// // Unsubscribing to the gossipsub topic "Royalty Transfer Notification"
-    /// client.unsubscribe_from_topic(String::from("ROYALTY_TRANSFER_NOTIFICATION"));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn unsubscribe_from_topic(&self, topic_id: String) {
-        info!("Unsubscribing from topic id: {topic_id}");
-        self.network.unsubscribe_from_topic(topic_id);
-    }
-
-    /// Publish message on given topic
-    ///
-    /// # Arguments
-    /// * 'topic_id' - [String]
-    /// * 'msg' - [Bytes]
-    ///
-    /// # Example
-    /// ```no_run
-    /// use sn_client::{Client, Error};
-    /// use bls::SecretKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
-    /// let msg = String::from("Transfer Successful.");
-    /// // Note the use of .into() to set the argument as bytes
-    /// client.publish_on_topic(String::from("ROYALTY_TRANSFER_NOTIFICATION"), msg.into());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn publish_on_topic(&self, topic_id: String, msg: Bytes) {
-        info!("Publishing msg on topic id: {topic_id}");
-        self.network.publish_on_topic(topic_id, msg);
+        // check spend
+        match signed_spend.verify(signed_spend.spent_tx_hash()) {
+            Ok(()) => {
+                trace!("Verified signed spend got from network for {address:?}");
+                Ok(signed_spend.clone())
+            }
+            Err(err) => {
+                warn!("Invalid signed spend got from network for {address:?}: {err:?}.");
+                Err(Error::CouldNotVerifyTransfer(format!(
+                    "Verification failed for spent at {address:?} with error {err:?}"
+                )))
+            }
+        }
     }
 
     /// This function is used to receive a Vector of CashNoteRedemptions and turn them back into spendable CashNotes.
@@ -1038,7 +1001,7 @@ impl Client {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
     /// use sn_transfers::{CashNote, CashNoteRedemption, MainPubkey};
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// // Create a main public key
     /// let pk = SecretKey::random().public_key();
     /// let main_pub_key = MainPubkey::new(pk);
@@ -1061,81 +1024,6 @@ impl Client {
             .verify_cash_notes_redemptions(main_pubkey, cashnote_redemptions)
             .await?;
         Ok(cash_notes)
-    }
-
-    /// Verify that chunks were uploaded
-    ///
-    /// Returns a vec of any chunks that could not be verified
-    ///
-    /// # Arguments
-    /// * 'chunks_paths' - [([XorName], [PathBuf])]
-    /// * 'batch_size' - usize
-    ///
-    /// Return Type:
-    ///
-    /// Result<[Vec]<([XorName], [PathBuf])>>
-    ///
-    /// # Example
-    /// ```no_run
-    /// use sn_client::{Client, Error};
-    /// use bls::SecretKey;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(),Error>{
-    /// use std::path::PathBuf;
-    /// use xor_name::XorName;
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
-    /// // Setup for chunk_path
-    /// let mut chunk_path = PathBuf::from("/");
-    /// // Setup an XorName
-    /// let mut rng = rand::thread_rng();
-    /// let xorname = XorName::random(&mut rng);
-    /// // set up the vector for check
-    /// let tuple_arg = (xorname,chunk_path);
-    /// let vector = vec![tuple_arg.clone(), tuple_arg.clone()];
-    /// // Verify Chunks
-    /// let verified_chunks = client.verify_uploaded_chunks(&vector,1).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn verify_uploaded_chunks(
-        &self,
-        chunks_paths: &[(XorName, PathBuf)],
-        batch_size: usize,
-    ) -> Result<Vec<(XorName, PathBuf)>> {
-        let mut failed_chunks = Vec::new();
-
-        for chunks_batch in chunks_paths.chunks(batch_size) {
-            // now we try and get batched chunks, keep track of any that fail
-            // Iterate over each uploaded chunk
-            let mut verify_handles = Vec::new();
-
-            for (name, chunk_path) in chunks_batch.iter().cloned() {
-                let client = self.clone();
-                // Spawn a new task to fetch each chunk concurrently
-                // this is specifically tokio here, as wasm-bindgen-futures breaks this
-                let handle = tokio::spawn(async move {
-                    // make sure the chunk is stored;
-                    let chunk = Chunk::new(Bytes::from(std::fs::read(&chunk_path)?));
-                    let res = client.verify_chunk_stored(&chunk).await;
-
-                    Ok::<_, ChunksError>(((name, chunk_path), res.is_err()))
-                });
-                verify_handles.push(handle);
-            }
-
-            // Await all fetch tasks and collect the results
-            let verify_results = join_all(verify_handles).await;
-
-            // Check for any errors during fetch
-            for result in verify_results {
-                if let ((chunk_addr, path), true) = result?? {
-                    warn!("Failed to fetch a chunk {chunk_addr:?}");
-                    failed_chunks.push((chunk_addr, path));
-                }
-            }
-        }
-
-        Ok(failed_chunks)
     }
 }
 
@@ -1182,7 +1070,7 @@ fn merge_split_register_records(
 
     // merge it with the others if they are valid
     let register: SignedRegister = all_registers.into_iter().fold(one_valid_reg, |mut acc, r| {
-        if acc.verified_merge(r).is_err() {
+        if acc.verified_merge(&r).is_err() {
             warn!("Skipping register that failed to merge. Entry found for {key:?}");
         }
         acc
@@ -1257,7 +1145,7 @@ mod tests {
 
         // test with 2 valid records: should return the two merged
         let mut expected_merge = signed_register1.clone();
-        expected_merge.merge(signed_register2)?;
+        expected_merge.merge(&signed_register2)?;
         let map = HashMap::from_iter(vec![
             (xorname1, (record1.clone(), peers1.clone())),
             (xorname2, (record2, peers2.clone())),

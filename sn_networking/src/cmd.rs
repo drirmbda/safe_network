@@ -8,13 +8,16 @@
 
 use crate::{
     driver::{PendingGetClosestType, SwarmDriver},
-    error::{Error, Result},
+    error::{NetworkError, Result},
+    event::TerminateNodeReason,
     multiaddr_pop_p2p, GetRecordCfg, GetRecordError, MsgResponder, NetworkEvent, CLOSE_GROUP_SIZE,
-    REPLICATE_RANGE,
+    REPLICATION_PEERS_COUNT,
 };
-use bytes::Bytes;
 use libp2p::{
-    kad::{store::RecordStore, Quorum, Record, RecordKey},
+    kad::{
+        store::{Error as StoreError, RecordStore},
+        Quorum, Record, RecordKey,
+    },
     swarm::dial_opts::DialOpts,
     Multiaddr, PeerId,
 };
@@ -23,9 +26,9 @@ use sn_protocol::{
     storage::{RecordHeader, RecordKind, RecordType},
     NetworkAddress, PrettyPrintRecordKey,
 };
-use sn_transfers::NanoTokens;
+use sn_transfers::{NanoTokens, PaymentQuote, QuotingMetrics};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
 };
 use tokio::sync::oneshot;
@@ -35,13 +38,23 @@ use crate::target_arch::Instant;
 
 const MAX_CONTINUOUS_HDD_WRITE_ERROR: usize = 5;
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum NodeIssue {
+    /// Connection issues observed
+    ConnectionIssue,
+    /// Data Replication failed
+    ReplicationFailure,
+    /// Close nodes have reported this peer as bad
+    CloseNodesShunning,
+    /// Provided a bad quote
+    BadQuoting,
+    /// Peer failed to pass the chunk proof verification
+    FailedChunkProofCheck,
+}
+
 /// Commands to send to the Swarm
 #[allow(clippy::large_enum_variant)]
 pub enum SwarmCmd {
-    StartListening {
-        addr: Multiaddr,
-        sender: oneshot::Sender<Result<()>>,
-    },
     Dial {
         addr: Multiaddr,
         sender: oneshot::Sender<Result<()>>,
@@ -111,7 +124,7 @@ pub enum SwarmCmd {
     /// GetLocalStoreCost for this node
     GetLocalStoreCost {
         key: RecordKey,
-        sender: oneshot::Sender<NanoTokens>,
+        sender: oneshot::Sender<(NanoTokens, QuotingMetrics)>,
     },
     /// Notify the node received a payment.
     PaymentReceived,
@@ -150,29 +163,22 @@ pub enum SwarmCmd {
     },
     /// Triggers interval repliation
     TriggerIntervalReplication,
-    /// Subscribe to a given Gossipsub topic
-    GossipsubSubscribe(String),
-    /// Unsubscribe from a given Gossipsub topic
-    GossipsubUnsubscribe(String),
-    /// Publish a message through Gossipsub protocol
-    GossipsubPublish {
-        /// Topic to publish on
-        topic_id: String,
-        /// Raw bytes of the message to publish
-        msg: Bytes,
-    },
-    GossipHandler,
     /// Notify whether peer is in trouble
-    SendNodeStatus {
+    RecordNodeIssue {
         peer_id: PeerId,
-        addrs: HashSet<Multiaddr>,
-        is_bad: bool,
+        issue: NodeIssue,
     },
     // Whether peer is considered as `in trouble` by self
-    IsPeerInTrouble {
+    IsPeerShunned {
         target: NetworkAddress,
         sender: oneshot::Sender<bool>,
     },
+    // Quote verification agaisnt historical collected quotes
+    QuoteVerification {
+        quotes: Vec<(PeerId, PaymentQuote)>,
+    },
+    // Notify a fetch completion
+    FetchCompleted(RecordKey),
 }
 
 /// Debug impl for SwarmCmd to avoid printing full Record, instead only RecodKey
@@ -180,9 +186,6 @@ pub enum SwarmCmd {
 impl Debug for SwarmCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SwarmCmd::StartListening { addr, .. } => {
-                write!(f, "SwarmCmd::StartListening {{ addr: {addr:?} }}")
-            }
             SwarmCmd::Dial { addr, .. } => {
                 write!(f, "SwarmCmd::Dial {{ addr: {addr:?} }}")
             }
@@ -230,19 +233,6 @@ impl Debug for SwarmCmd {
             }
             SwarmCmd::TriggerIntervalReplication => {
                 write!(f, "SwarmCmd::TriggerIntervalReplication")
-            }
-            SwarmCmd::GossipsubSubscribe(topic) => {
-                write!(f, "SwarmCmd::GossipsubSubscribe({topic:?})")
-            }
-            SwarmCmd::GossipsubUnsubscribe(topic) => {
-                write!(f, "SwarmCmd::GossipsubUnsubscribe({topic:?})")
-            }
-            SwarmCmd::GossipsubPublish { topic_id, msg } => {
-                write!(
-                    f,
-                    "SwarmCmd::GossipsubPublish {{ topic_id: {topic_id:?}, msg len: {:?} }}",
-                    msg.len()
-                )
             }
             SwarmCmd::DialWithOpts { opts, .. } => {
                 write!(f, "SwarmCmd::DialWithOpts {{ opts: {opts:?} }}")
@@ -294,19 +284,24 @@ impl Debug for SwarmCmd {
             SwarmCmd::SendRequest { req, peer, .. } => {
                 write!(f, "SwarmCmd::SendRequest req: {req:?}, peer: {peer:?}")
             }
-            SwarmCmd::GossipHandler => {
-                write!(f, "SwarmCmd::GossipHandler")
-            }
-            SwarmCmd::SendNodeStatus {
-                peer_id, is_bad, ..
-            } => {
+            SwarmCmd::RecordNodeIssue { peer_id, issue } => {
                 write!(
                     f,
-                    "SwarmCmd::SendNodeStatus peer {peer_id:?}, is_bad: {is_bad:?}"
+                    "SwarmCmd::SendNodeStatus peer {peer_id:?}, issue: {issue:?}"
                 )
             }
-            SwarmCmd::IsPeerInTrouble { target, .. } => {
+            SwarmCmd::IsPeerShunned { target, .. } => {
                 write!(f, "SwarmCmd::IsPeerInTrouble target: {target:?}")
+            }
+            SwarmCmd::QuoteVerification { quotes } => {
+                write!(f, "SwarmCmd::QuoteVerification of {} quotes", quotes.len())
+            }
+            SwarmCmd::FetchCompleted(key) => {
+                write!(
+                    f,
+                    "SwarmCmd::FetchCompleted({:?})",
+                    PrettyPrintRecordKey::from(key)
+                )
             }
         }
     }
@@ -321,9 +316,9 @@ pub struct SwarmLocalState {
 }
 
 impl SwarmDriver {
-    pub(crate) fn handle_cmd(&mut self, cmd: SwarmCmd) -> Result<(), Error> {
+    pub(crate) fn handle_cmd(&mut self, cmd: SwarmCmd) -> Result<(), NetworkError> {
         let start = Instant::now();
-        let mut cmd_string = "";
+        let mut cmd_string;
         match cmd {
             SwarmCmd::TriggerIntervalReplication => {
                 cmd_string = "TriggerIntervalReplication";
@@ -358,19 +353,13 @@ impl SwarmDriver {
             }
             SwarmCmd::GetLocalStoreCost { key, sender } => {
                 cmd_string = "GetLocalStoreCost";
-                let record_exists = self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .store_mut()
-                    .contains(&key);
-                let cost = if record_exists {
-                    NanoTokens::zero()
-                } else {
-                    self.swarm.behaviour_mut().kademlia.store_mut().store_cost()
-                };
-
-                let _res = sender.send(cost);
+                let _res = sender.send(
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .store_cost(&key),
+                );
             }
             SwarmCmd::PaymentReceived => {
                 cmd_string = "PaymentReceived";
@@ -415,7 +404,7 @@ impl SwarmDriver {
                     }
                     Err(error) => {
                         error!("Error sending record {record_key:?} to network");
-                        Err(Error::from(error))
+                        Err(NetworkError::from(error))
                     }
                 };
 
@@ -462,13 +451,13 @@ impl SwarmDriver {
                             }
                             RecordKind::ChunkWithPayment | RecordKind::RegisterWithPayment => {
                                 error!("Record {record_key:?} with payment shall not be stored locally.");
-                                return Err(Error::InCorrectRecordHeader);
+                                return Err(NetworkError::InCorrectRecordHeader);
                             }
                         }
                     }
                     Err(err) => {
                         error!("For record {record_key:?}, failed to parse record_header {err:?}");
-                        return Err(Error::InCorrectRecordHeader);
+                        return Err(NetworkError::InCorrectRecordHeader);
                     }
                 };
 
@@ -478,6 +467,33 @@ impl SwarmDriver {
                     .kademlia
                     .store_mut()
                     .put_verified(record, record_type.clone());
+
+                match result {
+                    Ok(_) => {
+                        // `replication_fetcher.farthest_acceptable_distance` shall only get
+                        // shrinked, instead of expanding, even with more nodes joined to share
+                        // the responsibility. Hence no need to reset it.
+                        // Also, as `record_store` is `prune 1 on 1 success put`, which means
+                        // once capacity reached max_records, there is only chance of rising slowly.
+                        // Due to the async/parrellel handling in replication_fetcher & record_store.
+                    }
+                    Err(StoreError::MaxRecords) => {
+                        // In case the capacity reaches full, restrict replication_fetcher to
+                        // only fetch entries not farther than the current farthest record
+                        let farthest = self
+                            .swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .store_mut()
+                            .get_farthest();
+                        self.replication_fetcher.set_farthest_on_full(farthest);
+                    }
+                    Err(_) => {
+                        // Nothing special to do for these errors,
+                        // All error cases are further logged and bubbled up below
+                    }
+                }
+
                 // No matter storing the record succeeded or not,
                 // the entry shall be removed from the `replication_fetcher`.
                 // In case of local store error, re-attempt will be carried out
@@ -496,20 +512,24 @@ impl SwarmDriver {
                     .behaviour_mut()
                     .kademlia
                     .store_mut()
-                    .get_distance_range()
+                    .get_farthest_replication_distance_bucket()
                 {
-                    self.replication_fetcher.set_distance_range(distance);
+                    self.replication_fetcher
+                        .set_replication_distance_range(distance);
                 }
 
                 if let Err(err) = result {
-                    error!("Cann't store verified record {record_key:?} locally: {err:?}");
+                    error!("Can't store verified record {record_key:?} locally: {err:?}");
                     cmd_string = "PutLocalRecord error";
                     self.log_handling(cmd_string.to_string(), start.elapsed());
                     return Err(err.into());
                 };
             }
             SwarmCmd::AddLocalRecordAsStored { key, record_type } => {
-                trace!("Adding Record locally, for {key:?} and {record_type:?}");
+                info!(
+                    "Adding Record locally, for {:?} and {record_type:?}",
+                    PrettyPrintRecordKey::from(&key)
+                );
                 cmd_string = "AddLocalRecordAsStored";
                 self.swarm
                     .behaviour_mut()
@@ -527,7 +547,9 @@ impl SwarmDriver {
                 // When there is certain amount of continuous HDD write error,
                 // the hard disk is considered as full, and the node shall be terminated.
                 if self.hard_disk_write_error > MAX_CONTINUOUS_HDD_WRITE_ERROR {
-                    self.send_event(NetworkEvent::TerminateNode);
+                    self.send_event(NetworkEvent::TerminateNode {
+                        reason: TerminateNodeReason::HardDiskWriteError,
+                    });
                 }
             }
             SwarmCmd::RecordStoreHasKey { key, sender } => {
@@ -551,19 +573,10 @@ impl SwarmDriver {
                     .record_addresses();
                 let _ = sender.send(addresses);
             }
-
-            SwarmCmd::StartListening { addr, sender } => {
-                cmd_string = "StartListening";
-                let _ = match self.swarm.listen_on(addr) {
-                    Ok(_) => sender.send(Ok(())),
-                    Err(e) => sender.send(Err(e.into())),
-                };
-            }
             SwarmCmd::Dial { addr, sender } => {
                 cmd_string = "Dial";
 
-                let mut addr_copy = addr.clone();
-                if let Some(peer_id) = multiaddr_pop_p2p(&mut addr_copy) {
+                if let Some(peer_id) = multiaddr_pop_p2p(&mut addr.clone()) {
                     // Only consider the dial peer is bootstrap node when proper PeerId is provided.
                     if let Some(kbucket) = self.swarm.behaviour_mut().kademlia.kbucket(peer_id) {
                         let ilog2 = kbucket.range().0.ilog2();
@@ -680,7 +693,7 @@ impl SwarmDriver {
                             Some(channel) => {
                                 channel
                                     .send(Ok(resp))
-                                    .map_err(|_| Error::InternalMsgChannelDropped)?;
+                                    .map_err(|_| NetworkError::InternalMsgChannelDropped)?;
                             }
                             None => {
                                 // responses that are not awaited at the call site must be handled
@@ -694,7 +707,7 @@ impl SwarmDriver {
                             .behaviour_mut()
                             .request_response
                             .send_response(channel, resp)
-                            .map_err(Error::OutgoingResponseDropped)?;
+                            .map_err(NetworkError::OutgoingResponseDropped)?;
                     }
                 }
             }
@@ -707,80 +720,48 @@ impl SwarmDriver {
 
                 sender
                     .send(current_state)
-                    .map_err(|_| Error::InternalMsgChannelDropped)?;
+                    .map_err(|_| NetworkError::InternalMsgChannelDropped)?;
             }
-            SwarmCmd::GossipsubSubscribe(topic_id) => {
-                let topic_id = libp2p::gossipsub::IdentTopic::new(topic_id);
-                if let Some(gossip) = self.swarm.behaviour_mut().gossipsub.as_mut() {
-                    gossip.subscribe(&topic_id)?;
-                }
-            }
-            SwarmCmd::GossipsubUnsubscribe(topic_id) => {
-                let topic_id = libp2p::gossipsub::IdentTopic::new(topic_id);
 
-                if let Some(gossip) = self.swarm.behaviour_mut().gossipsub.as_mut() {
-                    gossip.unsubscribe(&topic_id)?;
-                }
-            }
-            SwarmCmd::GossipsubPublish { topic_id, msg } => {
-                cmd_string = "GossipsubPublish";
-                // If we publish a Gossipsub message, we might not receive the same message on our side.
-                // Hence push an event to notify that we've published a message
-                if self.is_gossip_handler {
-                    self.send_event(NetworkEvent::GossipsubMsgPublished {
-                        topic: topic_id.clone(),
-                        msg: msg.clone(),
-                    });
-                }
-                let topic_id = libp2p::gossipsub::IdentTopic::new(topic_id);
-                if let Some(gossip) = self.swarm.behaviour_mut().gossipsub.as_mut() {
-                    gossip.publish(topic_id, msg)?;
-                }
-            }
-            SwarmCmd::GossipHandler => {
-                self.is_gossip_handler = true;
-            }
-            SwarmCmd::SendNodeStatus {
-                peer_id,
-                addrs,
-                is_bad,
-            } => {
-                cmd_string = "SendNodeStatus";
+            SwarmCmd::RecordNodeIssue { peer_id, issue } => {
+                cmd_string = "RecordNodeIssues";
                 let _ = self.bad_nodes_ongoing_verifications.remove(&peer_id);
-                if is_bad {
-                    info!("Peer {peer_id:?} is considered as bad");
-                    let _ = self.bad_nodes.insert(peer_id);
-
-                    warn!("Cleaning out bad_peer {peer_id:?}");
-                    if let Some(dead_peer) =
-                        self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id)
-                    {
-                        self.connected_peers = self.connected_peers.saturating_sub(1);
-                        self.send_event(NetworkEvent::PeerRemoved(
-                            *dead_peer.node.key.preimage(),
-                            self.connected_peers,
-                        ));
-                        self.log_kbuckets(&peer_id);
-                        let _ = self.check_for_change_in_our_close_group();
+                self.record_node_issue(peer_id, issue);
+            }
+            SwarmCmd::IsPeerShunned { target, sender } => {
+                cmd_string = "IsPeerInTrouble";
+                let is_bad = if let Some(peer_id) = target.as_peer_id() {
+                    if let Some((_issues, is_bad)) = self.bad_nodes.get(&peer_id) {
+                        *is_bad
+                    } else {
+                        false
                     }
                 } else {
-                    trace!(%peer_id, ?addrs, "peer considered as active, attempting to add addresses to routing table");
-
-                    for multiaddr in &addrs {
-                        let _routing_update = self
-                            .swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, multiaddr.clone());
+                    false
+                };
+                let _ = sender.send(is_bad);
+            }
+            SwarmCmd::QuoteVerification { quotes } => {
+                cmd_string = "QuoteVerification";
+                for (peer_id, quote) in quotes {
+                    // Do nothing if already being bad
+                    if let Some((_issues, is_bad)) = self.bad_nodes.get(&peer_id) {
+                        if *is_bad {
+                            continue;
+                        }
                     }
+                    self.verify_peer_quote(peer_id, quote);
                 }
             }
-            SwarmCmd::IsPeerInTrouble { target, sender } => {
-                cmd_string = "IsPeerInTrouble";
-                if let Some(peer_id) = target.as_peer_id() {
-                    let _ = sender.send(self.bad_nodes.contains(&peer_id));
-                } else {
-                    let _ = sender.send(false);
+            SwarmCmd::FetchCompleted(key) => {
+                info!(
+                    "Fetch {:?} early completed, may fetched an old version record.",
+                    PrettyPrintRecordKey::from(&key)
+                );
+                cmd_string = "FetchCompleted";
+                let new_keys_to_fetch = self.replication_fetcher.notify_fetch_early_completed(key);
+                if !new_keys_to_fetch.is_empty() {
+                    self.send_event(NetworkEvent::KeysToFetchForReplication(new_keys_to_fetch));
                 }
             }
         }
@@ -788,6 +769,92 @@ impl SwarmDriver {
         self.log_handling(cmd_string.to_string(), start.elapsed());
 
         Ok(())
+    }
+
+    fn record_node_issue(&mut self, peer_id: PeerId, issue: NodeIssue) {
+        info!("Peer {peer_id:?} is reported as having issue {issue:?}");
+        let (issue_vec, is_bad) = self.bad_nodes.entry(peer_id).or_default();
+
+        let mut is_new_bad = false;
+        let mut bad_behaviour: String = "".to_string();
+
+        // If being considered as bad already, skip certain operations
+        if !(*is_bad) {
+            // Remove outdated entries
+            issue_vec.retain(|(_, timestamp)| timestamp.elapsed().as_secs() < 300);
+
+            // check if vec is already 10 long, if so, remove the oldest issue
+            // we only track 10 issues to avoid mem leaks
+            if issue_vec.len() == 10 {
+                issue_vec.remove(0);
+            }
+
+            // To avoid being too sensitive, only consider as a new issue
+            // when after certain while since the last one
+            let is_new_issue = if let Some((_issue, timestamp)) = issue_vec.last() {
+                timestamp.elapsed().as_secs() > 10
+            } else {
+                true
+            };
+
+            if is_new_issue {
+                issue_vec.push((issue, Instant::now()));
+            }
+
+            // Only consider candidate as a bad node when:
+            //   accumulated THREE same kind issues within certain period
+            for (issue, _timestamp) in issue_vec.iter() {
+                let issue_counts = issue_vec
+                    .iter()
+                    .filter(|(i, _timestamp)| *issue == *i)
+                    .count();
+                if issue_counts >= 3 {
+                    *is_bad = true;
+                    is_new_bad = true;
+                    bad_behaviour = format!("{issue:?}");
+                    info!("Peer {peer_id:?} accumulated {issue_counts} times of issue {issue:?}. Consider it as a bad node now.");
+                    // Once a bad behaviour detected, no point to continue
+                    break;
+                }
+            }
+        }
+
+        if *is_bad {
+            warn!("Cleaning out bad_peer {peer_id:?}");
+            if let Some(dead_peer) = self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id) {
+                self.connected_peers = self.connected_peers.saturating_sub(1);
+                self.send_event(NetworkEvent::PeerRemoved(
+                    *dead_peer.node.key.preimage(),
+                    self.connected_peers,
+                ));
+                self.log_kbuckets(&peer_id);
+                let _ = self.check_for_change_in_our_close_group();
+            }
+
+            if is_new_bad {
+                self.send_event(NetworkEvent::PeerConsideredAsBad {
+                    detected_by: self.self_peer_id,
+                    bad_peer: peer_id,
+                    bad_behaviour,
+                });
+            }
+        }
+    }
+
+    fn verify_peer_quote(&mut self, peer_id: PeerId, quote: PaymentQuote) {
+        if let Some(history_quote) = self.quotes_history.get(&peer_id) {
+            if !history_quote.historical_verify(&quote) {
+                info!("From {peer_id:?}, detected a bad quote {quote:?} against history_quote {history_quote:?}");
+                self.record_node_issue(peer_id, NodeIssue::BadQuoting);
+                return;
+            }
+
+            if history_quote.is_newer_than(&quote) {
+                return;
+            }
+        }
+
+        let _ = self.quotes_history.insert(peer_id, quote);
     }
 
     fn try_interval_replication(&mut self) -> Result<()> {
@@ -805,7 +872,7 @@ impl SwarmDriver {
         let replicate_targets = closest_k_peers
             .into_iter()
             // add some leeway to allow for divergent knowledge
-            .take(REPLICATE_RANGE)
+            .take(REPLICATION_PEERS_COUNT)
             .collect::<Vec<_>>();
 
         let all_records: Vec<_> = self

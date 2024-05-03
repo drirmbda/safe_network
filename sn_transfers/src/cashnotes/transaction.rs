@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::BTreeSet};
 use tiny_keccak::{Hasher, Sha3};
 
-use crate::Error;
+use crate::TransferError;
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::result::Result<T, TransferError>;
 
 #[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct Input {
+    // pub_key of the cash_note that as this input
     pub unique_pubkey: UniquePubkey,
     pub amount: NanoTokens,
 }
@@ -41,15 +42,19 @@ impl Input {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct Output {
+    // pub_key of the derived_key that used for this output
     pub unique_pubkey: UniquePubkey,
     pub amount: NanoTokens,
+    // Purpose of this output, i.e. the reason why the output got generated.
+    pub purpose: String,
 }
 
 impl Output {
-    pub fn new(unique_pubkey: UniquePubkey, amount: u64) -> Self {
+    pub fn new(unique_pubkey: UniquePubkey, amount: u64, purpose: String) -> Self {
         Self {
             unique_pubkey,
             amount: NanoTokens::from(amount),
+            purpose,
         }
     }
 
@@ -57,6 +62,7 @@ impl Output {
         let mut v: Vec<u8> = Default::default();
         v.extend(self.unique_pubkey.to_bytes().as_ref());
         v.extend(self.amount.to_bytes());
+        v.extend(self.purpose.clone().into_bytes());
         v
     }
 
@@ -133,18 +139,20 @@ impl Transaction {
             .iter()
             .map(|i| i.amount)
             .try_fold(0, |acc: u64, i| {
-                acc.checked_add(i.as_nano()).ok_or(Error::NumericOverflow)
+                acc.checked_add(i.as_nano())
+                    .ok_or(TransferError::NumericOverflow)
             })?;
-        let output_sum: u64 = self
-            .outputs
-            .iter()
-            .map(|o| o.amount)
-            .try_fold(0, |acc: u64, o| {
-                acc.checked_add(o.as_nano()).ok_or(Error::NumericOverflow)
-            })?;
+        let output_sum: u64 =
+            self.outputs
+                .iter()
+                .map(|o| o.amount)
+                .try_fold(0, |acc: u64, o| {
+                    acc.checked_add(o.as_nano())
+                        .ok_or(TransferError::NumericOverflow)
+                })?;
 
         if input_sum != output_sum {
-            Err(Error::UnbalancedTransaction)
+            Err(TransferError::UnbalancedTransaction)
         } else {
             Ok(())
         }
@@ -159,10 +167,13 @@ impl Transaction {
     /// - the inputs and outputs are different
     /// - the inputs have a corresponding signed spend
     /// - those signed spends are valid and refer to this transaction
-    pub fn verify_against_inputs_spent(&self, signed_spends: &BTreeSet<SignedSpend>) -> Result<()> {
+    pub fn verify_against_inputs_spent<'a, T>(&self, signed_spends: T) -> Result<()>
+    where
+        T: IntoIterator<Item = &'a SignedSpend> + Clone,
+    {
         // verify that the tx has at least one input
         if self.inputs.is_empty() {
-            return Err(Error::MissingTxInputs);
+            return Err(TransferError::MissingTxInputs);
         }
 
         // check spends match the inputs
@@ -172,43 +183,38 @@ impl Transaction {
             .map(|i| i.unique_pubkey())
             .collect::<BTreeSet<_>>();
         let signed_spend_keys = signed_spends
-            .iter()
+            .clone()
+            .into_iter()
             .map(|s| s.unique_pubkey())
             .collect::<BTreeSet<_>>();
         if input_keys != signed_spend_keys {
             debug!("SpendsDoNotMatchInputs: {input_keys:#?} != {signed_spend_keys:#?}");
-            return Err(Error::SpendsDoNotMatchInputs);
+            return Err(TransferError::SpendsDoNotMatchInputs);
         }
 
         // Verify that each output is unique
         let output_pks: BTreeSet<&UniquePubkey> =
             self.outputs.iter().map(|o| (o.unique_pubkey())).collect();
         if output_pks.len() != self.outputs.len() {
-            return Err(Error::UniquePubkeyNotUniqueInTx);
+            return Err(TransferError::UniquePubkeyNotUniqueInTx);
         }
 
         // Verify that each input is unique
         let input_pks: BTreeSet<&UniquePubkey> =
             self.inputs.iter().map(|i| (i.unique_pubkey())).collect();
         if input_pks.len() != self.inputs.len() {
-            return Err(Error::UniquePubkeyNotUniqueInTx);
+            return Err(TransferError::UniquePubkeyNotUniqueInTx);
         }
 
         // Verify that inputs are different from outputs
         if !input_pks.is_disjoint(&output_pks) {
-            return Err(Error::UniquePubkeyNotUniqueInTx);
+            return Err(TransferError::UniquePubkeyNotUniqueInTx);
         }
 
-        // Verify that each signed spend is an output of our tx and that it is valid
+        // Verify that each signed spend is valid and was spent in this transaction
         let spent_tx_hash = self.hash();
-        for signed_spend in signed_spends.iter() {
-            let pk = signed_spend.unique_pubkey();
-            let is_in_tx = |o: &Output| o.unique_pubkey() == pk;
-            if !signed_spend.spend.parent_tx.outputs.iter().any(is_in_tx) {
-                debug!("OutputNotFound: {pk:?} is not an output of tx {spent_tx_hash:?}");
-                return Err(Error::OutputNotFound);
-            }
-            signed_spend.verify(spent_tx_hash)?;
+        for s in signed_spends {
+            s.verify(spent_tx_hash)?;
         }
 
         // Verify that the transaction is balanced

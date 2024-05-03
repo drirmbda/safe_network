@@ -11,7 +11,7 @@ use libp2p::{
     kad::{Quorum, Record, RecordKey},
     PeerId,
 };
-use sn_networking::{sort_peers_by_address, GetRecordCfg, Network, REPLICATE_RANGE};
+use sn_networking::{sort_peers_by_address, GetRecordCfg, Network, REPLICATION_PEERS_COUNT};
 use sn_protocol::{
     messages::{Cmd, Query, QueryResponse, Request, Response},
     storage::RecordType,
@@ -32,7 +32,7 @@ impl Node {
     ) -> Result<()> {
         for (holder, key) in keys_to_fetch {
             let node = self.clone();
-            let requester = NetworkAddress::from_peer(self.network.peer_id);
+            let requester = NetworkAddress::from_peer(*self.network.peer_id);
             let _handle: JoinHandle<Result<()>> = spawn(async move {
                 let pretty_key = PrettyPrintRecordKey::from(&key).into_owned();
                 trace!("Fetching record {pretty_key:?} from node {holder:?}");
@@ -112,7 +112,7 @@ impl Node {
                         error!(
                             "Replicating fresh record {pretty_key:?} get_record_from_store errored: {err:?}"
                         );
-                        return;
+                        None
                     }
                 };
 
@@ -124,7 +124,7 @@ impl Node {
                     error!(
                         "Could not get record from store for replication: {pretty_key:?} after 10 retries"
                     );
-                    break;
+                    return;
                 }
 
                 retry_count += 1;
@@ -143,14 +143,14 @@ impl Node {
             };
 
             // remove ourself from these calculations
-            closest_k_peers.retain(|peer_id| peer_id != &network.peer_id);
+            closest_k_peers.retain(|peer_id| peer_id != &*network.peer_id);
 
             let data_addr = NetworkAddress::from_record_key(&paid_key);
 
             let sorted_based_on_addr = match sort_peers_by_address(
                 &closest_k_peers,
                 &data_addr,
-                REPLICATE_RANGE,
+                REPLICATION_PEERS_COUNT,
             ) {
                 Ok(result) => result,
                 Err(err) => {
@@ -161,7 +161,7 @@ impl Node {
                 }
             };
 
-            let our_peer_id = network.peer_id;
+            let our_peer_id = *network.peer_id;
             let our_address = NetworkAddress::from_peer(our_peer_id);
             #[allow(clippy::mutable_key_type)] // for Bytes in NetworkAddress
             let keys = vec![(data_addr.clone(), record_type.clone())];

@@ -6,6 +6,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/joshuef/safe_network/compare/sn_networking-v0.14.0...sn_networking-v0.14.1) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_transfers
+
+## [0.14.0](https://github.com/joshuef/safe_network/compare/sn_networking-v0.13.35...sn_networking-v0.14.0) - 2024-03-27
+
+### Added
+- *(networking)* add NodeIssue for tracking bad node shunning
+- [**breaking**] remove gossip code
+- *(network)* filter out peers when returning store cost
+- use Arc inside Client, Network to reduce clone cost
+
+### Fixed
+- *(node)* fetching new data shall not cause timed_out immediately
+- *(test)* generate unique temp dir to avoid read outdated data
+
+### Other
+- *(node)* refactor pricing metrics
+- lower some networking log levels
+- *(node)* loose bad node detection criteria
+- *(node)* optimization to reduce logging
+
+## [0.13.35](https://github.com/joshuef/safe_network/compare/sn_networking-v0.13.34...sn_networking-v0.13.35) - 2024-03-21
+
+### Added
+- dag error recording
+
+### Other
+- *(node)* reduce bad_nodes check resource usage
+
+## [0.13.34](https://github.com/joshuef/safe_network/compare/sn_networking-v0.13.33...sn_networking-v0.13.34) - 2024-03-18
+
+### Added
+- *(networking)* listen on WS addr too
+- *(networking)* support fallback WS transport
+
+## [0.13.33](https://github.com/joshuef/safe_network/compare/sn_networking-v0.13.32...sn_networking-v0.13.33) - 2024-03-14
+
+### Added
+- refactor spend validation
+
+### Fixed
+- *(test)* use unqiue dir during test
+- dont stop spend verification at spend error, generalise spend serde
+- put validation network spends errors management
+
+### Other
+- improve code quality
+- *(release)* sn_transfers-v0.16.3/sn_cli-v0.89.82
+
 ## [0.13.32](https://github.com/joshuef/safe_network/compare/sn_networking-v0.13.31-alpha.0...sn_networking-v0.13.32) - 2024-03-08
 
 ### Other

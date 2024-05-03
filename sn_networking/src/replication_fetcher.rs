@@ -22,7 +22,9 @@ const MAX_PARALLEL_FETCH: usize = K_VALUE.get();
 
 // The duration after which a peer will be considered failed to fetch data from,
 // if no response got from that peer.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+// Note this will also cover the period that node self write the fetched copy to disk.
+// Hence shall give a longer time as allowance.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 // The duration after which a pending entry shall be cleared from the `to_be_fetch` list.
 // This is to avoid holding too many outdated entries when the fetching speed is slow.
@@ -39,8 +41,12 @@ pub(crate) struct ReplicationFetcher {
     // Avoid fetching same chunk from different nodes AND carry out too many parallel tasks.
     on_going_fetches: HashMap<(RecordKey, RecordType), (PeerId, ReplicationTimeout)>,
     event_sender: mpsc::Sender<NetworkEvent>,
-    // Distance range that the incoming key shall be fetched
-    distance_range: Option<Distance>,
+    /// ilog2 bucket distance range that the incoming key shall be fetched
+    distance_range: Option<u32>,
+    /// Restrict fetch range to closer than this value
+    /// used when the node is full, but we still have "close" data coming in
+    /// that is _not_ closer than our farthest max record
+    farthest_acceptable_distance: Option<Distance>,
 }
 
 impl ReplicationFetcher {
@@ -52,11 +58,12 @@ impl ReplicationFetcher {
             on_going_fetches: HashMap::new(),
             event_sender,
             distance_range: None,
+            farthest_acceptable_distance: None,
         }
     }
 
     /// Set the distance range.
-    pub(crate) fn set_distance_range(&mut self, distance_range: Distance) {
+    pub(crate) fn set_replication_distance_range(&mut self, distance_range: u32) {
         self.distance_range = Some(distance_range);
     }
 
@@ -67,44 +74,122 @@ impl ReplicationFetcher {
     pub(crate) fn add_keys(
         &mut self,
         holder: PeerId,
-        incoming_keys: Vec<(NetworkAddress, RecordType)>,
+        mut incoming_keys: Vec<(NetworkAddress, RecordType)>,
         locally_stored_keys: &HashMap<RecordKey, (NetworkAddress, RecordType)>,
     ) -> Vec<(PeerId, RecordKey)> {
         self.remove_stored_keys(locally_stored_keys);
+        let self_address = NetworkAddress::from_peer(self.self_peer_id);
+        let total_incoming_keys = incoming_keys.len();
 
-        let is_new_data = if incoming_keys.len() == 1 {
-            // The incoming list is for a new data to be replicated out.
+        // In case of node full, restrict fetch range
+        if let Some(farthest_distance) = self.farthest_acceptable_distance {
+            let mut out_of_range_keys = vec![];
+            incoming_keys.retain(|(addr, _)| {
+                let is_in_range = self_address.distance(addr) <= farthest_distance;
+                if !is_in_range {
+                    out_of_range_keys.push(addr.clone());
+                }
+                is_in_range
+            });
+
+            info!("Node is full, among {total_incoming_keys} incoming replications from {holder:?}, found {} beyond current farthest", out_of_range_keys.len());
+            for addr in out_of_range_keys.iter() {
+                trace!("Node is full, the incoming record_key {addr:?} is beyond current farthest record");
+            }
+        }
+
+        let mut keys_to_fetch = vec![];
+        // For new data, it will be replicated out in a special replication_list of length 1.
+        // And we shall `fetch` that copy immediately (if in range), if it's not being fetched.
+        if incoming_keys.len() == 1 {
             let (record_address, record_type) = incoming_keys[0].clone();
-            Some((record_address.to_record_key(), record_type))
-        } else {
-            None
-        };
+
+            let new_data_key = (record_address.to_record_key(), record_type);
+
+            if let Entry::Vacant(entry) = self.on_going_fetches.entry(new_data_key.clone()) {
+                let (record_key, _record_type) = new_data_key;
+                keys_to_fetch.push((holder, record_key));
+                let _ = entry.insert((holder, Instant::now() + FETCH_TIMEOUT));
+            }
+
+            // To avoid later on un-necessary actions.
+            incoming_keys.clear();
+        }
 
         self.to_be_fetched
             .retain(|_, time_out| *time_out > Instant::now());
 
-        // add non existing keys to the fetcher
-        incoming_keys
-            .into_iter()
-            .for_each(|(key, record_type)| self.add_key(holder, key.to_record_key(), record_type));
+        let mut out_of_range_keys = vec![];
+        // Filter out those out_of_range ones among the imcoming_keys.
+        if let Some(ref distance_range) = self.distance_range {
+            incoming_keys.retain(|(addr, _record_type)| {
+                let is_in_range =
+                    self_address.distance(addr).ilog2().unwrap_or(0) <= *distance_range;
+                if !is_in_range {
+                    out_of_range_keys.push(addr.clone());
+                }
+                is_in_range
+            });
+        }
 
-        let mut keys_to_fetch = self.next_keys_to_fetch();
-
-        // For new data, it will be replicated out in a special replication_list of length 1.
-        // And we shall `fetch` that copy immediately, if it's not being fetched.
-        if let Some(new_data_key) = is_new_data {
-            if let Entry::Vacant(entry) = self.on_going_fetches.entry(new_data_key.clone()) {
-                let (record_key, _record_type) = new_data_key;
-                keys_to_fetch.push((holder, record_key));
-                let _ = entry.insert((holder, Instant::now()));
+        if !out_of_range_keys.is_empty() {
+            info!("Among {total_incoming_keys} incoming replications from {holder:?}, found {} out of range", out_of_range_keys.len());
+            for addr in out_of_range_keys.iter() {
+                let ilog2_distance = self_address.distance(addr).ilog2();
+                trace!("The incoming record_key {addr:?} is out of range with ilog2_distance being {ilog2_distance:?}, do not fetch it from {holder:?}");
             }
         }
+
+        // add in-range AND non existing keys to the fetcher
+        incoming_keys.into_iter().for_each(|(addr, record_type)| {
+            let _ = self
+                .to_be_fetched
+                .entry((addr.to_record_key(), record_type, holder))
+                .or_insert(Instant::now() + PENDING_TIMEOUT);
+        });
+
+        keys_to_fetch.extend(self.next_keys_to_fetch());
+
         keys_to_fetch
+    }
+
+    // Node is full, any fetch (ongoing or new) shall no farther than the current farthest.
+    pub(crate) fn set_farthest_on_full(&mut self, farthest_in: Option<RecordKey>) {
+        let self_addr = NetworkAddress::from_peer(self.self_peer_id);
+
+        let new_farthest_distance = if let Some(farthest_in) = farthest_in {
+            let addr = NetworkAddress::from_record_key(&farthest_in);
+            self_addr.distance(&addr)
+        } else {
+            return;
+        };
+
+        if let Some(old_farthest_distance) = self.farthest_acceptable_distance {
+            if new_farthest_distance >= old_farthest_distance {
+                return;
+            }
+        }
+
+        // Remove any ongoing or pending fetches that is farther than the current farthest
+        self.to_be_fetched.retain(|(key, _t, _), _| {
+            let addr = NetworkAddress::from_record_key(key);
+            self_addr.distance(&addr) <= new_farthest_distance
+        });
+        self.on_going_fetches.retain(|(key, _t), _| {
+            let addr = NetworkAddress::from_record_key(key);
+            self_addr.distance(&addr) <= new_farthest_distance
+        });
+
+        self.farthest_acceptable_distance = Some(new_farthest_distance);
     }
 
     // Notify the replication fetcher about a newly added Record to the node.
     // The corresponding key can now be removed from the replication fetcher.
     // Also returns the next set of keys that has to be fetched from the peer/network.
+    //
+    // Note: for Register, which different content (i.e. record_type) bearing same record_key
+    //       remove `on_going_fetches` entry bearing same `record_key` only,
+    //       to avoid false FetchFailed alarm against the peer.
     pub(crate) fn notify_about_new_put(
         &mut self,
         new_put: RecordKey,
@@ -114,7 +199,19 @@ impl ReplicationFetcher {
             .retain(|(key, t, _), _| key != &new_put || t != &record_type);
 
         // if we're actively fetching for the key, reduce the on_going_fetches
-        let _ = self.on_going_fetches.remove(&(new_put, record_type));
+        self.on_going_fetches.retain(|(key, _t), _| key != &new_put);
+
+        self.next_keys_to_fetch()
+    }
+
+    // An early completion of a fetch means the target is an old version record (Register or Spend).
+    pub(crate) fn notify_fetch_early_completed(
+        &mut self,
+        key_in: RecordKey,
+    ) -> Vec<(PeerId, RecordKey)> {
+        self.to_be_fetched.retain(|(key, _t, _), _| key != &key_in);
+
+        self.on_going_fetches.retain(|(key, _t), _| key != &key_in);
 
         self.next_keys_to_fetch()
     }
@@ -125,7 +222,7 @@ impl ReplicationFetcher {
     pub(crate) fn next_keys_to_fetch(&mut self) -> Vec<(PeerId, RecordKey)> {
         self.prune_expired_keys_and_slow_nodes();
 
-        info!("Next to fetch....");
+        trace!("Next to fetch....");
 
         if self.on_going_fetches.len() >= MAX_PARALLEL_FETCH {
             warn!("Replication Fetcher doesn't have free fetch capacity. Currently has {} entries in queue.",
@@ -202,23 +299,36 @@ impl ReplicationFetcher {
     //   1, the pending_entries from that node shall be removed from `to_be_fetched` list.
     //   2, firing event up to notify bad_nodes, hence trigger them to be removed from RT.
     fn prune_expired_keys_and_slow_nodes(&mut self) {
-        let mut failed_holders = BTreeSet::default();
+        let mut failed_fetches = vec![];
 
-        self.on_going_fetches.retain(|_, (peer_id, time_out)| {
-            if *time_out < Instant::now() {
-                failed_holders.insert(*peer_id);
-                false
-            } else {
-                true
-            }
-        });
+        self.on_going_fetches
+            .retain(|(record_key, _), (peer_id, time_out)| {
+                if *time_out < Instant::now() {
+                    failed_fetches.push((record_key.clone(), *peer_id));
+                    false
+                } else {
+                    true
+                }
+            });
 
-        // now we ensure we clear our any/all failed nodes from our lists.
+        let mut failed_holders = BTreeSet::new();
+
+        for (record_key, peer_id) in failed_fetches {
+            error!(
+                "Failed to fetch {:?} from {peer_id:?}",
+                PrettyPrintRecordKey::from(&record_key)
+            );
+            let _ = failed_holders.insert(peer_id);
+        }
+
+        // now to clear any failed nodes from our lists.
         self.to_be_fetched
             .retain(|(_, _, holder), _| !failed_holders.contains(holder));
 
-        // Such failed_hodlers shall be reported back and be excluded from RT.
-        self.send_event(NetworkEvent::FailedToFetchHolders(failed_holders));
+        // Such failed_hodlers (if any) shall be reported back and be excluded from RT.
+        if !failed_holders.is_empty() {
+            self.send_event(NetworkEvent::FailedToFetchHolders(failed_holders));
+        }
     }
 
     /// Remove keys that we hold already and no longer need to be replicated.
@@ -242,25 +352,6 @@ impl ReplicationFetcher {
                 true
             }
         });
-    }
-
-    /// Add the key if not present yet.
-    fn add_key(&mut self, holder: PeerId, key: RecordKey, record_type: RecordType) {
-        // Do nothing if the incoming key is out_of_range
-        if let Some(ref distance_range) = self.distance_range {
-            let self_address = NetworkAddress::from_peer(self.self_peer_id);
-            let in_address = NetworkAddress::from_record_key(&key);
-
-            if self_address.distance(&in_address) >= *distance_range {
-                info!("The incoming record_key {in_address:?} is out of range, do not fetch it from {holder:?}");
-                return;
-            }
-        }
-
-        let _ = self
-            .to_be_fetched
-            .entry((key, record_type, holder))
-            .or_insert(Instant::now() + PENDING_TIMEOUT);
     }
 
     /// Sends an event after pushing it off thread so as to be non-blocking
@@ -345,5 +436,43 @@ mod tests {
         assert!(keys_to_fetch.is_empty());
 
         Ok(())
+    }
+
+    #[test]
+    fn verify_in_range_check() {
+        //random peer_id
+        let peer_id = PeerId::random();
+        let self_address = NetworkAddress::from_peer(peer_id);
+        let (event_sender, _event_receiver) = mpsc::channel(4);
+        let mut replication_fetcher = ReplicationFetcher::new(peer_id, event_sender);
+
+        // Set distance range
+        let distance_target = NetworkAddress::from_peer(PeerId::random());
+        let distance_range = self_address.distance(&distance_target).ilog2().unwrap_or(1);
+        replication_fetcher.set_replication_distance_range(distance_range);
+
+        let mut incoming_keys = Vec::new();
+        let mut in_range_keys = 0;
+        (0..100).for_each(|_| {
+            let random_data: Vec<u8> = (0..50).map(|_| rand::random::<u8>()).collect();
+            let key = NetworkAddress::from_record_key(&RecordKey::from(random_data));
+
+            if key.distance(&self_address).ilog2().unwrap_or(0) <= distance_range {
+                in_range_keys += 1;
+            }
+
+            incoming_keys.push((key, RecordType::Chunk));
+        });
+
+        let keys_to_fetch =
+            replication_fetcher.add_keys(PeerId::random(), incoming_keys, &Default::default());
+        assert_eq!(
+            keys_to_fetch.len(),
+            replication_fetcher.on_going_fetches.len()
+        );
+        assert_eq!(
+            in_range_keys,
+            keys_to_fetch.len() + replication_fetcher.to_be_fetched.len()
+        );
     }
 }

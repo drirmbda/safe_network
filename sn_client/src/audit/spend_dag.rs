@@ -8,14 +8,36 @@
 
 use petgraph::dot::Dot;
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
-use sn_transfers::{is_genesis_spend, CashNoteRedemption, NanoTokens, SignedSpend, SpendAddress};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use sn_transfers::{
+    is_genesis_spend, CashNoteRedemption, NanoTokens, SignedSpend, SpendAddress,
+    CASHNOTE_PURPOSE_OF_GENESIS, CASHNOTE_PURPOSE_OF_NETWORK_ROYALTIES,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::Path,
+};
 
-use crate::error::{Error, Result};
+use super::dag_error::{DagError, SpendFault};
 
-use super::dag_error::DagError;
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct SpendDagAddress {
+    address: SpendAddress,
+    purpose: String,
+}
+
+impl std::fmt::Debug for SpendDagAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "address: {}\npurpose: {}",
+            &self.address.to_hex()[0..6],
+            self.purpose
+        )
+    }
+}
 
 /// A DAG representing the spends from a specific Spend all the way to the UTXOs.
 /// Starting from Genesis, this would encompass all the spends that have happened on the network
@@ -31,12 +53,46 @@ use super::dag_error::DagError;
 ///                       -> Spend4 ---> UTXO_8
 ///
 /// ```
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpendDag {
     /// A directed graph of spend addresses
-    dag: DiGraph<SpendAddress, NanoTokens>,
-    /// All the spends refered to in the dag along with their index in the dag, indexed by their SpendAddress
-    spends: BTreeMap<SpendAddress, Vec<(Option<SignedSpend>, usize)>>,
+    dag: DiGraph<SpendDagAddress, NanoTokens>,
+    /// All the spends refered to in the dag indexed by their SpendAddress
+    spends: BTreeMap<SpendAddress, DagEntry>,
+    /// The source of the DAG (aka Genesis)
+    source: SpendAddress,
+    /// Recorded faults in the DAG
+    faults: BTreeMap<SpendAddress, BTreeSet<SpendFault>>,
+    /// Creation reasons (purpose) of the spends
+    creation_reasons: BTreeMap<SpendAddress, (String, NanoTokens)>,
+}
+
+type DagIndex = usize;
+
+/// Internal Dag entry type
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+enum DagEntry {
+    NotGatheredYet(DagIndex),
+    DoubleSpend(Vec<(SignedSpend, DagIndex)>),
+    Spend(Box<SignedSpend>, DagIndex),
+}
+
+impl DagEntry {
+    fn indexes(&self) -> Vec<DagIndex> {
+        match self {
+            DagEntry::NotGatheredYet(idx) => vec![*idx],
+            DagEntry::DoubleSpend(spends) => spends.iter().map(|(_, idx)| *idx).collect(),
+            DagEntry::Spend(_, idx) => vec![*idx],
+        }
+    }
+
+    fn spends(&self) -> Vec<&SignedSpend> {
+        match self {
+            DagEntry::Spend(spend, _) => vec![&**spend],
+            DagEntry::DoubleSpend(spends) => spends.iter().map(|(s, _)| s).collect(),
+            DagEntry::NotGatheredYet(_) => vec![],
+        }
+    }
 }
 
 /// The result of a get operation on the DAG
@@ -44,155 +100,226 @@ pub struct SpendDag {
 pub enum SpendDagGet {
     /// Spend does not exist in the DAG
     SpendNotFound,
-    /// Spend is an UTXO, meaning it was not spent yet but its ancestors exist
-    SpendIsAnUtxo,
+    /// Spend key is refered to by known spends but does not exist in the DAG yet
+    Utxo,
     /// Spend is a double spend
-    DoubleSpend,
+    DoubleSpend(Vec<SignedSpend>),
     /// Spend is in the DAG
     Spend(Box<SignedSpend>),
 }
 
 impl SpendDag {
-    pub fn new() -> Self {
+    /// Create a new DAG with a given source
+    pub fn new(source: SpendAddress) -> Self {
         Self {
             dag: DiGraph::new(),
             spends: BTreeMap::new(),
+            source,
+            faults: BTreeMap::new(),
+            creation_reasons: BTreeMap::new(),
         }
     }
 
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn source(&self) -> SpendAddress {
+        self.source
+    }
+
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         let bytes = std::fs::read(path)?;
         let dag: SpendDag = rmp_serde::from_slice(&bytes)?;
         Ok(dag)
     }
 
-    pub fn dump_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    pub fn dump_to_file<P: AsRef<Path>>(&self, path: P) -> crate::Result<()> {
         let bytes = rmp_serde::to_vec(&self)?;
         std::fs::write(path, bytes)?;
         Ok(())
+    }
+
+    fn get_dag_address(&self, spend_addr: &SpendAddress) -> SpendDagAddress {
+        let spend_creation_reason =
+            if let Some((creation_reason, _amount)) = self.creation_reasons.get(spend_addr) {
+                creation_reason.clone()
+            } else {
+                CASHNOTE_PURPOSE_OF_GENESIS.to_string()
+            };
+        SpendDagAddress {
+            address: *spend_addr,
+            purpose: spend_creation_reason,
+        }
     }
 
     /// Insert a spend into the dag
     /// Creating edges (links) from its ancestors and to its descendants
     /// If the inserted spend is already known, it will be ignored
     /// If the inserted spend is a double spend, it will be saved along with the previous spend
-    pub fn insert(&mut self, spend_addr: SpendAddress, spend: SignedSpend) {
-        // get existing entries for this address
-        let entries = self.spends.entry(spend_addr).or_default();
-        let existing_entry = entries.iter_mut().find(|(s, _idx)| {
-            match s {
-                // there is an already an entry for the same spend at this address
-                Some(existing_spend) => existing_spend == &spend,
-                // there is an UTXO entry for this address
-                None => true,
+    /// Return true if the spend was inserted and false if it was already in the DAG
+    pub fn insert(&mut self, spend_addr: SpendAddress, spend: SignedSpend) -> bool {
+        for output in spend.outputs().iter() {
+            let output_spend_address = SpendAddress::from_unique_pubkey(&output.unique_pubkey);
+            if let Some(old) = self.creation_reasons.insert(
+                output_spend_address,
+                (output.purpose.clone(), output.amount),
+            ) {
+                error!("Spend {output_spend_address:?} already have an un-expected creation reason: {old:?}");
             }
-        });
+        }
 
-        // update existing entry or save our spend as new
-        let node_idx = match existing_entry {
-            Some(entry) => {
-                *entry = (Some(spend.clone()), entry.1);
-                NodeIndex::new(entry.1)
+        let spend_dag_address = self.get_dag_address(&spend_addr);
+
+        let existing_entry = self.spends.get(&spend_addr).cloned();
+        let new_node_idx = match existing_entry {
+            // add new spend to the DAG
+            None => {
+                let node_idx = self.dag.add_node(spend_dag_address);
+                self.spends.insert(
+                    spend_addr,
+                    DagEntry::Spend(Box::new(spend.clone()), node_idx.index()),
+                );
+                node_idx
             }
-            _ => {
-                let node_idx = self.dag.add_node(spend_addr);
-                entries.push((Some(spend.clone()), node_idx.index()));
+            // or upgrade a known but not gathered entry to spend
+            Some(DagEntry::NotGatheredYet(idx)) => {
+                self.spends
+                    .insert(spend_addr, DagEntry::Spend(Box::new(spend.clone()), idx));
+                let node_idx = NodeIndex::new(idx);
+                self.remove_all_edges(node_idx);
+                node_idx
+            }
+            // or upgrade spend to double spend if it is different from the existing one
+            Some(DagEntry::Spend(s, idx)) => {
+                let existing_spend = *s.clone();
+                if existing_spend == spend {
+                    return false;
+                }
+
+                let node_idx = self.dag.add_node(spend_dag_address);
+                let double_spend = DagEntry::DoubleSpend(vec![
+                    (existing_spend.clone(), idx),
+                    (spend.clone(), node_idx.index()),
+                ]);
+                self.spends.insert(spend_addr, double_spend);
+                node_idx
+            }
+            // or add extra spend to an existing double spend if it is unknown yet
+            Some(DagEntry::DoubleSpend(vec_s)) => {
+                if vec_s.iter().any(|(s, _idx)| s == &spend) {
+                    return false;
+                }
+
+                let node_idx = self.dag.add_node(spend_dag_address);
+                let mut vec_s = vec_s.clone();
+                vec_s.push((spend.clone(), node_idx.index()));
+                self.spends.insert(spend_addr, DagEntry::DoubleSpend(vec_s));
                 node_idx
             }
         };
 
-        // link to ancestors
-        let spend_amount = spend.token();
-        for ancestor in spend.spend.parent_tx.inputs.iter() {
-            let ancestor_addr = SpendAddress::from_unique_pubkey(&ancestor.unique_pubkey);
-
-            // add ancestor if not already in dag
-            let spends_at_addr = self.spends.entry(ancestor_addr).or_insert_with(|| {
-                let node_idx = self.dag.add_node(ancestor_addr);
-                vec![(None, node_idx.index())]
-            });
-
-            // link to ancestor
-            for (_, idx) in spends_at_addr {
-                let ancestor_idx = NodeIndex::new(*idx);
-                self.dag.update_edge(ancestor_idx, node_idx, *spend_amount);
-            }
-        }
-
         // link to descendants
         for descendant in spend.spend.spent_tx.outputs.iter() {
             let descendant_addr = SpendAddress::from_unique_pubkey(&descendant.unique_pubkey);
+            let descendant_dag_address = self.get_dag_address(&descendant_addr);
 
             // add descendant if not already in dag
             let spends_at_addr = self.spends.entry(descendant_addr).or_insert_with(|| {
-                let node_idx = self.dag.add_node(descendant_addr);
-                vec![(None, node_idx.index())]
+                let node_idx = self.dag.add_node(descendant_dag_address);
+                DagEntry::NotGatheredYet(node_idx.index())
             });
 
             // link to descendant
-            for (_, idx) in spends_at_addr {
-                let descendant_idx = NodeIndex::new(*idx);
+            for idx in spends_at_addr.indexes() {
+                let descendant_idx = NodeIndex::new(idx);
                 self.dag
-                    .update_edge(node_idx, descendant_idx, descendant.amount);
+                    .update_edge(new_node_idx, descendant_idx, descendant.amount);
             }
         }
-    }
 
-    /// checks for existing spend at this address and inserts it if it's new
-    /// returns true if it did insert and false if it was already in the DAG
-    /// errors out but saves the spend in case of a double spend
-    pub fn check_and_insert(
-        &mut self,
-        spend_addr: SpendAddress,
-        spend: SignedSpend,
-    ) -> Result<bool> {
-        if let Some(existing_spends) = self.spends.get(&spend_addr) {
-            match existing_spends.as_slice() {
-                // there is an already an entry for the same spend at this address
-                [(Some(existing_spend), _)] if existing_spend == &spend => Ok(false),
-                // there is already an entry for another spend at this address
-                [(Some(existing_spend), _)] if existing_spend != &spend => {
-                    // save and report double spend
-                    let e = Err(Error::DoubleSpend(
-                        spend_addr,
-                        Box::new(existing_spend.clone()),
-                        Box::new(spend.clone()),
-                    ));
-                    self.insert(spend_addr, spend);
-                    e
-                }
-                // there is an UTXO entry for this address
-                [(None, _)] => {
-                    // save spend
-                    self.insert(spend_addr, spend);
-                    Ok(true)
-                }
-                // there are already multiple spends at this address
-                [(Some(spend1), _), (Some(spend2), _), ..] => Err(Error::DoubleSpend(
-                    spend_addr,
-                    Box::new(spend1.clone()),
-                    Box::new(spend2.clone()),
-                )),
-                // dag is incoherent
-                _ => Err(Error::InvalidDag),
-            }
-        } else {
-            // there is no entry for this address
-            self.insert(spend_addr, spend);
-            Ok(true)
+        // do not link to ancestors if the spend is the source
+        if spend_addr == self.source {
+            return true;
         }
+
+        // link to ancestors
+        const PENDING_AMOUNT: NanoTokens = NanoTokens::from(0);
+        for ancestor in spend.spend.parent_tx.inputs.iter() {
+            let ancestor_addr = SpendAddress::from_unique_pubkey(&ancestor.unique_pubkey);
+            let ancestor_dag_address = self.get_dag_address(&ancestor_addr);
+
+            // add ancestor if not already in dag
+            let spends_at_addr = self.spends.entry(ancestor_addr).or_insert_with(|| {
+                let node_idx = self.dag.add_node(ancestor_dag_address);
+                DagEntry::NotGatheredYet(node_idx.index())
+            });
+
+            // link to ancestor
+            match spends_at_addr {
+                DagEntry::NotGatheredYet(idx) => {
+                    let ancestor_idx = NodeIndex::new(*idx);
+                    self.dag
+                        .update_edge(ancestor_idx, new_node_idx, PENDING_AMOUNT);
+                }
+                DagEntry::Spend(ancestor_spend, idx) => {
+                    let ancestor_idx = NodeIndex::new(*idx);
+                    let ancestor_given_amount = ancestor_spend
+                        .spend
+                        .spent_tx
+                        .outputs
+                        .iter()
+                        .find(|o| o.unique_pubkey == spend.spend.unique_pubkey)
+                        .map(|o| o.amount)
+                        .unwrap_or(PENDING_AMOUNT);
+                    self.dag
+                        .update_edge(ancestor_idx, new_node_idx, ancestor_given_amount);
+                }
+                DagEntry::DoubleSpend(multiple_ancestors) => {
+                    for (ancestor_spend, ancestor_idx) in multiple_ancestors {
+                        if ancestor_spend.spend.spent_tx.hash() == spend.spend.parent_tx.hash() {
+                            let ancestor_idx = NodeIndex::new(*ancestor_idx);
+                            let ancestor_given_amount = ancestor_spend
+                                .spend
+                                .spent_tx
+                                .outputs
+                                .iter()
+                                .find(|o| o.unique_pubkey == spend.spend.unique_pubkey)
+                                .map(|o| o.amount)
+                                .unwrap_or(PENDING_AMOUNT);
+                            self.dag
+                                .update_edge(ancestor_idx, new_node_idx, ancestor_given_amount);
+                        }
+                    }
+                }
+            }
+        }
+
+        true
     }
 
-    pub fn get_utxos(&self) -> Vec<SpendAddress> {
-        let mut leaves = Vec::new();
+    /// Get spend addresses that probably exist as they are refered to by spends we know,
+    /// but we haven't gathered them yet
+    /// This includes UTXOs and unknown ancestors
+    pub fn get_pending_spends(&self) -> BTreeSet<SpendAddress> {
+        self.spends
+            .iter()
+            .filter_map(|(addr, entry)| match entry {
+                DagEntry::NotGatheredYet(_) => Some(*addr),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the UTXOs: all the addresses that are refered to as children by other spends
+    /// but that don't have children themselves.
+    /// Those will eventually exist on the Network as the address is spent by their owners.
+    pub fn get_utxos(&self) -> BTreeSet<SpendAddress> {
+        let mut leaves = BTreeSet::new();
         for node_index in self.dag.node_indices() {
             if !self
                 .dag
                 .neighbors_directed(node_index, petgraph::Direction::Outgoing)
                 .any(|_| true)
             {
-                let utxo_addr = self.dag[node_index];
-                leaves.push(utxo_addr);
+                let utxo_addr = self.dag[node_index].address;
+                leaves.insert(utxo_addr);
             }
         }
         leaves
@@ -202,140 +329,217 @@ impl SpendDag {
         format!("{:?}", Dot::with_config(&self.dag, &[]))
     }
 
+    pub fn dump_creation_reasons_statistics(&self) -> String {
+        let mut statistics: BTreeMap<String, Vec<NanoTokens>> = Default::default();
+        for (_spend_addr, (reason, amount)) in self.creation_reasons.iter() {
+            let holders = statistics.entry(reason.clone()).or_default();
+            holders.push(*amount);
+        }
+        let mut content = "Purpose,Times,Amount".to_string();
+        for (purpose, payments) in statistics.iter() {
+            let total_amount: u64 = payments
+                .iter()
+                .map(|nano_tokens| nano_tokens.as_nano())
+                .sum();
+            content = format!("{content}\n{purpose},{},{total_amount}", payments.len());
+        }
+        content
+    }
+
     /// Merges the given dag into ours
-    pub fn merge(&mut self, sub_dag: SpendDag) {
+    pub fn merge(&mut self, sub_dag: SpendDag) -> Result<(), DagError> {
+        let source = self.source();
+        info!(
+            "Merging sub DAG starting at {:?} into our DAG with source {:?}",
+            sub_dag.source(),
+            source
+        );
         for (addr, spends) in sub_dag.spends {
-            for (spend, _idx) in spends {
-                // only add spends to the dag, ignoring utxos
-                // utxos will be added automatically as their ancestors are added
-                // edges are updated by the insert method
-                if let Some(spend) = spend {
-                    self.insert(addr, spend);
+            // only add spends to the dag, ignoring utxos and not yet gathered relatives
+            // utxos will be added automatically as their ancestors are added
+            // edges are updated by the insert method
+            match spends {
+                DagEntry::NotGatheredYet(_) => continue,
+                DagEntry::DoubleSpend(spends) => {
+                    for (spend, _) in spends {
+                        self.insert(addr, spend);
+                    }
+                }
+                DagEntry::Spend(spend, _) => {
+                    self.insert(addr, *spend);
                 }
             }
         }
+
+        // recompute faults
+        self.record_faults(&source)
     }
 
     /// Get the spend at a given address
     pub fn get_spend(&self, addr: &SpendAddress) -> SpendDagGet {
         match self.spends.get(addr) {
             None => SpendDagGet::SpendNotFound,
-            Some(spends) => match spends.as_slice() {
-                [(Some(spend), _)] => SpendDagGet::Spend(Box::new(spend.clone())),
-                [(None, _)] => SpendDagGet::SpendIsAnUtxo,
-                _ => SpendDagGet::DoubleSpend,
-            },
+            Some(DagEntry::NotGatheredYet(_)) => SpendDagGet::Utxo,
+            Some(DagEntry::DoubleSpend(spends)) => {
+                SpendDagGet::DoubleSpend(spends.iter().map(|(s, _)| s.clone()).collect())
+            }
+            Some(DagEntry::Spend(spend, _)) => SpendDagGet::Spend(spend.clone()),
         }
+    }
+
+    /// Get the recorded faults if any for a given spend address
+    pub fn get_spend_faults(&self, addr: &SpendAddress) -> BTreeSet<SpendFault> {
+        self.faults.get(addr).cloned().unwrap_or_default()
+    }
+
+    /// Helper to get underlying index of spend entry in the DAG
+    /// This unstable API is used to access the underlying graph for testing purposes
+    /// An empty vec is returned if the spend is not in the DAG
+    pub fn get_spend_indexes(&self, addr: &SpendAddress) -> Vec<usize> {
+        self.spends
+            .get(addr)
+            .map(|spends| spends.indexes())
+            .unwrap_or_default()
     }
 
     /// Get all spends from the DAG
     pub fn all_spends(&self) -> Vec<&SignedSpend> {
         self.spends
             .values()
-            .flat_map(|spends| {
-                spends
-                    .iter()
-                    .filter_map(|(s, _)| s.as_ref())
-                    .collect::<Vec<&SignedSpend>>()
-            })
+            .flat_map(|entry| entry.spends())
             .collect()
     }
 
     /// Get all royalties from the DAG
-    pub fn all_royalties(&self) -> Result<Vec<CashNoteRedemption>> {
+    pub fn all_royalties(&self) -> crate::Result<Vec<CashNoteRedemption>> {
         let spends = self.all_spends();
         let mut royalties = Vec::new();
         for s in spends {
             for derivation_idx in s.spend.network_royalties.iter() {
                 let spend_addr = SpendAddress::from_unique_pubkey(&s.spend.unique_pubkey);
-                royalties.push(CashNoteRedemption::new(*derivation_idx, spend_addr));
+                royalties.push(CashNoteRedemption::new(
+                    *derivation_idx,
+                    spend_addr,
+                    CASHNOTE_PURPOSE_OF_NETWORK_ROYALTIES.to_string(),
+                ));
             }
         }
         Ok(royalties)
     }
 
-    /// helper that returns the spend at a given address if it is unique (not double spend) and not an UTXO
-    fn get_unique_spend_at(
-        &self,
-        addr: &SpendAddress,
-        recorded_errors: &mut Vec<DagError>,
-    ) -> Option<(&SignedSpend, usize)> {
-        let spends = self.spends.get(addr)?;
-        match spends.as_slice() {
-            // spend
-            [(Some(s), i)] => Some((s, *i)),
-            // utxo
-            [(None, _)] => None,
-            // double spend
-            _ => {
-                recorded_errors.push(DagError::DoubleSpend(*addr));
-                None
-            }
+    /// Remove all edges from a Node in the DAG
+    fn remove_all_edges(&mut self, node: NodeIndex) {
+        let incoming: Vec<_> = self
+            .dag
+            .edges_directed(node, petgraph::Direction::Incoming)
+            .map(|e| e.id())
+            .collect();
+        let outgoing: Vec<_> = self
+            .dag
+            .edges_directed(node, petgraph::Direction::Outgoing)
+            .map(|e| e.id())
+            .collect();
+        for edge in incoming.into_iter().chain(outgoing.into_iter()) {
+            self.dag.remove_edge(edge);
         }
     }
 
     /// helper that returns the direct ancestors of a given spend
-    fn get_ancestor_spends(
+    /// along with any faults detected
+    /// On error returns the address of the missing ancestor
+    fn get_direct_ancestors(
         &self,
         spend: &SignedSpend,
-    ) -> std::result::Result<BTreeSet<SignedSpend>, DagError> {
+    ) -> Result<(BTreeSet<SignedSpend>, BTreeSet<SpendFault>), SpendAddress> {
+        let addr = spend.address();
         let mut ancestors = BTreeSet::new();
+        let mut faults = BTreeSet::new();
         for input in spend.spend.parent_tx.inputs.iter() {
             let ancestor_addr = SpendAddress::from_unique_pubkey(&input.unique_pubkey);
-            match self.get_unique_spend_at(&ancestor_addr, &mut vec![]) {
-                Some((ancestor_spend, _)) => {
-                    ancestors.insert(ancestor_spend.clone());
+            match self.spends.get(&ancestor_addr) {
+                Some(DagEntry::Spend(ancestor_spend, _)) => {
+                    ancestors.insert(*ancestor_spend.clone());
                 }
-                None => {
-                    return Err(DagError::MissingAncestry(ancestor_addr));
+                Some(DagEntry::NotGatheredYet(_)) | None => {
+                    warn!("Direct ancestor of {spend:?} at {ancestor_addr:?} is missing");
+                    return Err(ancestor_addr);
+                }
+                Some(DagEntry::DoubleSpend(multiple_ancestors)) => {
+                    debug!("Direct ancestor for spend {spend:?} at {ancestor_addr:?} is a double spend");
+                    faults.insert(SpendFault::DoubleSpentAncestor {
+                        addr,
+                        ancestor: ancestor_addr,
+                    });
+                    let actual_ancestor: Vec<_> = multiple_ancestors
+                        .iter()
+                        .filter(|(s, _)| s.spend.spent_tx.hash() == spend.spend.parent_tx.hash())
+                        .map(|(s, _)| s.clone())
+                        .collect();
+                    match actual_ancestor.as_slice() {
+                        [ancestor_spend] => {
+                            debug!("Direct ancestor of {spend:?} at {ancestor_addr:?} is a double spend but one of those match our parent_tx hash, using it for verification");
+                            ancestors.insert(ancestor_spend.clone());
+                        }
+                        [ancestor1, _ancestor2, ..] => {
+                            warn!("Direct ancestor of {spend:?} at {ancestor_addr:?} is a double spend and mutliple match our parent_tx hash, using the first one for verification");
+                            ancestors.insert(ancestor1.clone());
+                        }
+                        [] => {
+                            warn!("Direct ancestor of {spend:?} at {ancestor_addr:?} is a double spend and none of them match the spend parent_tx, which means the parent for this spend is missing!");
+                            return Err(ancestor_addr);
+                        }
+                    }
                 }
             }
         }
-        Ok(ancestors)
+        Ok((ancestors, faults))
     }
 
     /// helper that returns all the descendants (recursively all the way to UTXOs) of a given spend
-    fn all_descendants(
-        &self,
-        addr: &SpendAddress,
-        recorded_errors: &mut Vec<DagError>,
-    ) -> BTreeSet<&SpendAddress> {
+    fn all_descendants(&self, addr: &SpendAddress) -> Result<BTreeSet<&SpendAddress>, DagError> {
         let mut descendants = BTreeSet::new();
         let mut to_traverse = BTreeSet::from_iter(vec![addr]);
         while let Some(current_addr) = to_traverse.pop_first() {
-            // get descendants via DAG
-            let (spend, idx) = match self.get_unique_spend_at(current_addr, recorded_errors) {
-                Some(s) => s,
-                None => continue,
+            // get the spend at this address
+            let dag_entry = match self.spends.get(current_addr) {
+                Some(entry) => entry,
+                None => {
+                    warn!("Incoherent DAG, missing descendant spend when expecting one at: {current_addr:?}");
+                    return Err(DagError::IncoherentDag(
+                        *current_addr,
+                        format!("Missing descendant spend in DAG at: {current_addr:?}"),
+                    ));
+                }
             };
-            let descendants_via_dag: BTreeSet<&SpendAddress> = self
-                .dag
-                .neighbors_directed(NodeIndex::new(idx), petgraph::Direction::Outgoing)
-                .map(|i| &self.dag[i])
-                .collect();
+            let (spends, indexes) = (dag_entry.spends(), dag_entry.indexes());
 
             // get descendants via Tx data
-            let descendants_via_tx: BTreeSet<SpendAddress> = self
-                .spends
-                .get(current_addr)
-                .cloned()
-                .unwrap_or(vec![])
+            let descendants_via_tx: BTreeSet<SpendAddress> = spends
                 .into_iter()
-                .filter_map(|(s, _)| s)
                 .flat_map(|s| s.spend.spent_tx.outputs.to_vec())
                 .map(|o| SpendAddress::from_unique_pubkey(&o.unique_pubkey))
                 .collect();
 
+            // get descendants via DAG
+            let descendants_via_dag: BTreeSet<&SpendAddress> = indexes
+                .into_iter()
+                .flat_map(|idx| {
+                    self.dag
+                        .neighbors_directed(NodeIndex::new(idx), petgraph::Direction::Outgoing)
+                        .map(|i| &self.dag[i].address)
+                })
+                .collect();
+
             // report inconsistencies
             if descendants_via_dag != descendants_via_tx.iter().collect() {
-                if !is_genesis_spend(spend) {
+                if matches!(dag_entry, DagEntry::NotGatheredYet(_)) {
+                    debug!("Spend at {current_addr:?} was not gathered yet and has children refering to it, continuing traversal through those children...");
+                } else {
                     warn!("Incoherent DAG at: {current_addr:?}");
-                    recorded_errors.push(DagError::IncoherentDag(
+                    return Err(DagError::IncoherentDag(
                         *current_addr,
                         format!("descendants via DAG: {descendants_via_dag:?} do not match descendants via TX: {descendants_via_tx:?}")
                     ));
-                } else {
-                    debug!("Found Genesis at: {current_addr:?}");
                 }
             }
 
@@ -344,102 +548,272 @@ impl SpendDag {
             to_traverse.extend(not_transversed);
             descendants.extend(descendants_via_dag.iter().cloned());
         }
-        descendants
+        Ok(descendants)
     }
 
     /// find all the orphans in the DAG and record them as OrphanSpend
-    fn find_orphans(&self, source: &SpendAddress, recorded_errors: &mut Vec<DagError>) {
+    /// returns the list of OrphanSpend and other errors encountered in the way
+    fn find_orphans(&self, source: &SpendAddress) -> Result<BTreeSet<SpendFault>, DagError> {
+        let mut recorded_faults = BTreeSet::new();
         let all_addresses: BTreeSet<&SpendAddress> = self.spends.keys().collect();
-        let descendants = self.all_descendants(source, recorded_errors);
+        let all_descendants = self.all_descendants(source)?;
+        let parents: BTreeSet<_> = self
+            .get_spend_indexes(source)
+            .into_iter()
+            .flat_map(|idx| {
+                self.dag
+                    .neighbors_directed(NodeIndex::new(idx), petgraph::Direction::Incoming)
+            })
+            .map(|parent_idx| &self.dag[parent_idx].address)
+            .collect();
+        let non_orphans =
+            BTreeSet::from_iter(all_descendants.into_iter().chain(parents).chain([source]));
+
+        // orphans are those that are neither descandants nor source's parents nor source itself
         let orphans: BTreeSet<&SpendAddress> =
-            all_addresses.difference(&descendants).cloned().collect();
+            all_addresses.difference(&non_orphans).cloned().collect();
         for orphan in orphans {
             let src = *source;
-            let orphan = *orphan;
-            recorded_errors.push(DagError::OrphanSpend { orphan, src });
+            let addr = *orphan;
+            debug!("Found orphan: {orphan:?} of {src:?}");
+            recorded_faults.insert(SpendFault::OrphanSpend { addr, src });
         }
+
+        Ok(recorded_faults)
     }
 
-    /// Verify the DAG
-    /// Returns a list of errors found in the DAG
-    /// Note that the `MissingSource` error makes the entire DAG invalid
-    pub fn verify(&self, source: &SpendAddress) -> Vec<DagError> {
-        info!("Verifying DAG starting off: {source:?}");
-        let mut recorded_errors = Vec::new();
+    /// Checks if a double spend has multiple living descendant branches that fork
+    fn double_spend_has_forking_descendant_branches(&self, spends: &Vec<&SignedSpend>) -> bool {
+        // gather all living descendants for each branch
+        let mut set_of_living_descendants: BTreeSet<BTreeSet<_>> = BTreeSet::new();
+        for spend in spends {
+            let gathered_descendants = spend
+                .spend
+                .spent_tx
+                .outputs
+                .iter()
+                .map(|o| SpendAddress::from_unique_pubkey(&o.unique_pubkey))
+                .filter_map(|a| self.spends.get(&a))
+                .filter_map(|s| {
+                    if matches!(s, DagEntry::NotGatheredYet(_)) {
+                        None
+                    } else {
+                        Some(s.spends())
+                    }
+                })
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            set_of_living_descendants.insert(gathered_descendants);
+        }
 
-        // verify DAG source is unique (Genesis in case of a complete DAG)
-        debug!("Verifying DAG source is unique: {source:?}");
-        let (_source_spend, _) = match self.get_unique_spend_at(source, &mut recorded_errors) {
-            Some(s) => s,
-            None => {
-                recorded_errors.push(DagError::MissingSource(*source));
-                return recorded_errors;
+        // make sure there is no fork
+        for set1 in set_of_living_descendants.iter() {
+            for set2 in set_of_living_descendants.iter() {
+                if set1.is_subset(set2) || set2.is_subset(set1) {
+                    continue;
+                } else {
+                    return true;
+                }
             }
-        };
+        }
 
-        // identify orphans
+        false
+    }
+
+    /// Verify the DAG and record faults in the DAG
+    /// If the DAG is invalid, return an error immediately, without mutating the DAG
+    pub fn record_faults(&mut self, source: &SpendAddress) -> Result<(), DagError> {
+        let faults = self.verify(source)?;
+
+        self.faults.clear();
+        for f in faults {
+            self.faults.entry(f.spend_address()).or_default().insert(f);
+        }
+        Ok(())
+    }
+
+    /// Verify the DAG and return faults detected in the DAG
+    /// If the DAG itself is invalid, return an error immediately
+    pub fn verify(&self, source: &SpendAddress) -> Result<BTreeSet<SpendFault>, DagError> {
+        info!("Verifying DAG starting off: {source:?}");
+        let mut recorded_faults = BTreeSet::new();
+
+        // verify the DAG is acyclic
+        if petgraph::algo::is_cyclic_directed(&self.dag) {
+            warn!("DAG is cyclic");
+            return Err(DagError::DagContainsCycle(*source));
+        }
+
+        // verify DAG source exists in the DAG (Genesis in case of a complete DAG)
+        debug!("Verifying DAG source: {source:?}");
+        match self.spends.get(source) {
+            None => {
+                debug!("DAG does not contain its source: {source:?}");
+                return Err(DagError::MissingSource(*source));
+            }
+            Some(DagEntry::DoubleSpend(_)) => {
+                debug!("DAG source is a double spend: {source:?}");
+                recorded_faults.insert(SpendFault::DoubleSpend(*source));
+            }
+            _ => (),
+        }
+
+        // identify orphans (spends that don't come from the source)
         debug!("Looking for orphans of {source:?}");
-        self.find_orphans(source, &mut recorded_errors);
+        recorded_faults.extend(self.find_orphans(source)?);
 
         // check all transactions
         for (addr, _) in self.spends.iter() {
             debug!("Verifying transaction at: {addr:?}");
             // get the spend at this address
-            let (spend, _) = match self.get_unique_spend_at(addr, &mut recorded_errors) {
-                Some(s) => s,
-                None => continue,
-            };
+            let spends = self
+                .spends
+                .get(addr)
+                .map(|s| s.spends())
+                .unwrap_or_default();
 
-            // skip if genesis
-            if is_genesis_spend(spend) {
-                debug!("Skip transaction verification for Genesis at: {addr:?}");
+            // record double spends
+            if spends.len() > 1 {
+                debug!("Found a double spend entry in DAG at {addr:?}");
+                recorded_faults.insert(SpendFault::DoubleSpend(*addr));
+                let direct_descendants: BTreeSet<SpendAddress> = spends
+                    .iter()
+                    .flat_map(|s| s.spend.spent_tx.outputs.iter())
+                    .map(|o| SpendAddress::from_unique_pubkey(&o.unique_pubkey))
+                    .collect();
+                debug!("Making the direct descendants of the double spend at {addr:?} as faulty: {direct_descendants:?}");
+                for a in direct_descendants.iter() {
+                    recorded_faults.insert(SpendFault::DoubleSpentAncestor {
+                        addr: *a,
+                        ancestor: *addr,
+                    });
+                }
+                if self.double_spend_has_forking_descendant_branches(&spends) {
+                    debug!("Double spend at {addr:?} has multiple living descendant branches, poisoning them...");
+                    let poison = format!(
+                        "spend is on one of multiple branches of a double spent ancestor: {addr:?}"
+                    );
+                    let direct_living_descendant_spends: BTreeSet<_> = direct_descendants
+                        .iter()
+                        .filter_map(|a| self.spends.get(a))
+                        .flat_map(|s| s.spends())
+                        .collect();
+                    for s in direct_living_descendant_spends {
+                        recorded_faults.extend(self.poison_all_descendants(s, poison.clone())?);
+                    }
+                }
                 continue;
             }
 
-            // get the ancestors of this spend
-            let ancestor_spends = match self.get_ancestor_spends(spend) {
-                Ok(a) => a,
-                Err(e) => {
-                    recorded_errors.push(e);
-                    continue;
-                }
-            };
+            // skip parent Tx verification for source as we don't know its ancestors
+            if addr == source {
+                debug!("Skip transaction verification for source at: {addr:?}");
+                continue;
+            }
 
-            // verify the tx
-            match spend
-                .spend
-                .parent_tx
-                .verify_against_inputs_spent(&ancestor_spends)
-            {
-                Ok(_) => (),
-                Err(e) => {
-                    // mark all descendants as poisoned if tx is invalid
-                    recorded_errors.push(DagError::InvalidTransaction(*addr, format!("{e}")));
-                    for d in self.all_descendants(addr, &mut recorded_errors) {
-                        recorded_errors.push(DagError::PoisonedAncestry(
-                            *d,
-                            format!("ancestor transaction was poisoned at: {addr:?}: {e}"),
-                        ))
-                    }
-                }
+            // verify parent Tx
+            for s in spends {
+                recorded_faults.extend(self.verify_parent_tx(s)?);
             }
         }
 
         info!(
-            "Found {} errors: {recorded_errors:#?}",
-            recorded_errors.len()
+            "Found {} faults: {recorded_faults:#?}",
+            recorded_faults.len()
         );
-        recorded_errors
+        Ok(recorded_faults)
+    }
+
+    /// Verifies a single transaction and returns resulting errors and DAG poisoning spread
+    fn verify_parent_tx(&self, spend: &SignedSpend) -> Result<BTreeSet<SpendFault>, DagError> {
+        let addr = spend.address();
+        let mut recorded_faults = BTreeSet::new();
+        debug!(
+            "Verifying transaction {} at: {addr:?}",
+            spend.spend.parent_tx.hash().to_hex()
+        );
+
+        // skip if spend matches genesis
+        if is_genesis_spend(spend) {
+            debug!("Skip transaction verification for Genesis at: {addr:?}");
+            return Ok(recorded_faults);
+        }
+
+        // get the ancestors of this spend
+        let (ancestor_spends, faults) = match self.get_direct_ancestors(spend) {
+            Ok(a) => a,
+            Err(missing_ancestor) => {
+                debug!("Failed to get ancestor spends of {addr:?} as ancestor at {missing_ancestor:?} is missing");
+                recorded_faults.insert(SpendFault::MissingAncestry {
+                    addr,
+                    ancestor: missing_ancestor,
+                });
+
+                let poison = format!("missing ancestor at: {missing_ancestor:?}");
+                let descendants_faults = self.poison_all_descendants(spend, poison)?;
+                recorded_faults.extend(descendants_faults);
+                return Ok(recorded_faults);
+            }
+        };
+        recorded_faults.extend(faults);
+
+        // verify the tx
+        if let Err(e) = spend
+            .spend
+            .parent_tx
+            .verify_against_inputs_spent(&ancestor_spends)
+        {
+            warn!("Parent Tx verfication failed for spend at: {addr:?}: {e}");
+            recorded_faults.insert(SpendFault::InvalidTransaction(addr, format!("{e}")));
+            let poison = format!("ancestor transaction was poisoned at: {addr:?}: {e}");
+            let descendants_faults = self.poison_all_descendants(spend, poison)?;
+            recorded_faults.extend(descendants_faults);
+        }
+
+        Ok(recorded_faults)
+    }
+
+    /// Poison all descendants of a spend with given the poison message
+    fn poison_all_descendants(
+        &self,
+        spend: &SignedSpend,
+        poison: String,
+    ) -> Result<BTreeSet<SpendFault>, DagError> {
+        let mut recorded_faults = BTreeSet::new();
+        let spent_tx = spend.spent_tx();
+        let direct_descendants = spent_tx
+            .outputs
+            .iter()
+            .map(|o| SpendAddress::from_unique_pubkey(&o.unique_pubkey))
+            .collect::<BTreeSet<_>>();
+        let mut all_descendants = direct_descendants
+            .iter()
+            .map(|addr| self.all_descendants(addr))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<&SpendAddress>>();
+        all_descendants.extend(direct_descendants.iter());
+
+        for d in all_descendants {
+            recorded_faults.insert(SpendFault::PoisonedAncestry(*d, poison.clone()));
+        }
+
+        Ok(recorded_faults)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use xor_name::XorName;
+
     use super::*;
 
     #[test]
     fn test_spend_dag_serialisation() {
-        let dag = SpendDag::new();
+        let mut rng = rand::thread_rng();
+        let dummy_source = SpendAddress::new(XorName::random(&mut rng));
+        let dag = SpendDag::new(dummy_source);
         let serialized_data = rmp_serde::to_vec(&dag).expect("Serialization failed");
         let deserialized_instance: SpendDag =
             rmp_serde::from_slice(&serialized_data).expect("Deserialization failed");

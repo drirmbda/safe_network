@@ -11,12 +11,12 @@ use crate::send_tokens;
 use base64::Engine;
 use color_eyre::eyre::{eyre, Result};
 use serde::{Deserialize, Serialize};
+use sn_client::acc_packet::load_account_wallet_or_create_with_mnemonic;
 use sn_client::Client;
-use sn_transfers::{MainPubkey, NanoTokens};
+use sn_transfers::{get_faucet_data_dir, MainPubkey, NanoTokens};
 use std::str::FromStr;
 use std::{collections::HashMap, path::PathBuf};
 use tracing::info;
-use url::Url;
 
 const SNAPSHOT_FILENAME: &str = "snapshot.json";
 const SNAPSHOT_URL: &str = "https://api.omniexplorer.info/ask.aspx?api=getpropertybalances&prop=3";
@@ -384,10 +384,9 @@ pub async fn distribute_from_maid_to_tokens(
 
 pub async fn handle_distribution_req(
     client: &Client,
-    url: Url,
+    query: HashMap<String, String>,
     balances: Snapshot,
 ) -> Result<String> {
-    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
     let address = query
         .get("address")
         .ok_or(eyre!("Missing address in querystring"))?
@@ -447,15 +446,19 @@ async fn create_distribution(
         "Distributing {} for {} to {}",
         amount, claim.address, claim.wallet
     );
+
+    let faucet_dir = get_faucet_data_dir();
+    let faucet_wallet = load_account_wallet_or_create_with_mnemonic(&faucet_dir, None)?;
     // create a transfer to the claim wallet
-    let transfer_hex = match send_tokens(client, &amount.to_string(), &claim.wallet).await {
-        Ok(t) => t,
-        Err(err) => {
-            let msg = format!("Failed send for {0}: {err}", claim.address);
-            info!(msg);
-            return Err(eyre!(msg));
-        }
-    };
+    let transfer_hex =
+        match send_tokens(client, faucet_wallet, &amount.to_string(), &claim.wallet).await {
+            Ok(t) => t,
+            Err(err) => {
+                let msg = format!("Failed send for {0}: {err}", claim.address);
+                info!(msg);
+                return Err(eyre!(msg));
+            }
+        };
     let _ = match hex::decode(transfer_hex.clone()) {
         Ok(t) => t,
         Err(err) => {
@@ -550,8 +553,7 @@ mod tests {
             .cashnote_redemptions(&MainSecretKey::new(wallet_sk.clone()))
             .is_ok());
 
-        let receiver_client =
-            Client::new(bls::SecretKey::random(), None, false, None, None).await?;
+        let receiver_client = Client::new(bls::SecretKey::random(), None, None, None).await?;
         let tmp_path = TempDir::new()?.path().to_owned();
         let receiver_wallet =
             HotWallet::load_from_path(&tmp_path, Some(MainSecretKey::new(wallet_sk)))?;

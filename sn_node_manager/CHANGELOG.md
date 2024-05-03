@@ -6,6 +6,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.7.1...sn-node-manager-v0.7.2) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_service_management
+
+## [0.7.1](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.7.0...sn-node-manager-v0.7.1) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_transfers
+
+## [0.7.0](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.6.1...sn-node-manager-v0.7.0) - 2024-03-27
+
+### Added
+- [**breaking**] remove gossip code
+- add `--interval` arg to `start` command
+- arguments can be used multiple times
+- provide `--rpc-port` arg for `add` cmd
+- provide `--metrics-port` arg for `add` cmd
+- uniform behaviour for all `add` commands
+
+### Fixed
+- preclude removed services from ops
+- permit removal of manually removed services
+- *(manager)* store exclusive reference to service data instead of cloning
+
+### Other
+- refresh node registry before commands
+- fix wrong command in usage example
+- clarify version number usage
+
+## [0.6.1](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.6.0...sn-node-manager-v0.6.1) - 2024-03-21
+
+### Added
+- uniform behaviour for all `add` commands
+- *(protocol)* add rpc to set node log level on the fly
+
+### Other
+- run `safenodemand` service as root
+- upgrade `sn-releases` to new minor version
+- remove churn example from node manager
+
+## [0.6.0](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.5.1...sn-node-manager-v0.6.0) - 2024-03-14
+
+### Added
+- *(manager)* add example to cause churn to a running network
+- add rpc to fetch status from the daemon
+
+### Fixed
+- dont stop spend verification at spend error, generalise spend serde
+- *(deps)* add missing service management dep
+
+### Other
+- store test utils under a new crate
+- reorganise command processing
+- *(service)* make the add node naming more explicit
+- *(service)* remove the node service restart workaround
+- extend `status` cmd for faucet and daemon
+- add daemon service behaves uniformly
+- correctly run node manager unit tests
+- introduce `add_services` module
+- move rpc to its own module
+- [**breaking**] uniform service management
+- new `sn_service_management` crate
+- *(release)* sn_transfers-v0.16.3/sn_cli-v0.89.82
+
 ## [0.5.1](https://github.com/joshuef/safe_network/compare/sn-node-manager-v0.5.0-alpha.0...sn-node-manager-v0.5.1) - 2024-03-08
 
 ### Other

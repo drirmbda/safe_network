@@ -96,14 +96,21 @@ build-release-artifacts arch:
     if [[ "$(grep -E '^NAME="Ubuntu"' /etc/os-release)" ]]; then
       # This is intended for use on a fresh Github Actions agent
       sudo apt update -y
-      sudo apt install -y musl-tools
+      sudo apt-get install -y musl-tools
     fi
-    rustup target add x86_64-unknown-linux-musl
   fi
+
+  rustup target add {{arch}}
 
   rm -rf artifacts
   mkdir artifacts
   cargo clean
+
+  if [[ -n "${NETWORK_VERSION_MODE+x}" ]]; then
+    echo "The NETWORK_VERSION_MODE variable is set to $NETWORK_VERSION_MODE"
+    export CROSS_CONTAINER_OPTS="--env NETWORK_VERSION_MODE=$NETWORK_VERSION_MODE"
+  fi
+
   if [[ $arch == arm* || $arch == armv7* || $arch == aarch64* ]]; then
     cargo install cross
     cross build --release --features="network-contacts,distribution" --target $arch --bin safe
@@ -112,6 +119,7 @@ build-release-artifacts arch:
     cross build --release --target $arch --bin safenodemand
     cross build --release --target $arch --bin faucet --features=distribution
     cross build --release --target $arch --bin safenode_rpc_client
+    cross build --release --target $arch --bin node-launchpad
   else
     cargo build --release --features="network-contacts,distribution" --target $arch --bin safe
     cargo build --release --features=network-contacts --target $arch --bin safenode
@@ -119,6 +127,7 @@ build-release-artifacts arch:
     cargo build --release --target $arch --bin safenodemand
     cargo build --release --target $arch --bin faucet --features=distribution
     cargo build --release --target $arch --bin safenode_rpc_client
+    cargo build --release --target $arch --bin node-launchpad
   fi
 
   find target/$arch/release -maxdepth 1 -type f -exec cp '{}' artifacts \;
@@ -161,28 +170,35 @@ package-release-assets bin version="":
   )
 
   bin="{{bin}}"
-  supported_bins=("safe" "safenode" "safenode-manager" "safenodemand" "faucet" "safenode_rpc_client")
-  crate=""
 
+  supported_bins=(\
+    "safe" "safenode" "safenode-manager" "safenodemand" "faucet" "safenode_rpc_client" "node-launchpad")
+  crate_dir_name=""
+
+  # In the case of the node manager, the actual name of the crate is `sn-node-manager`, but the
+  # directory it's in is `sn_node_manager`.
   bin="{{bin}}"
   case "$bin" in
     safe)
-      crate="sn_cli"
+      crate_dir_name="sn_cli"
       ;;
     safenode)
-      crate="sn_node"
+      crate_dir_name="sn_node"
       ;;
     safenode-manager)
-      crate="sn_node_manager"
+      crate_dir_name="sn_node_manager"
       ;;
     safenodemand)
-      crate="sn_node_manager"
+      crate_dir_name="sn_node_manager"
       ;;
     faucet)
-      crate="sn_faucet"
+      crate_dir_name="sn_faucet"
       ;;
     safenode_rpc_client)
-      crate="sn_node_rpc_client"
+      crate_dir_name="sn_node_rpc_client"
+      ;;
+    node-launchpad)
+      crate_dir_name="sn_node_launchpad"
       ;;
     *)
       echo "The $bin binary is not supported"
@@ -191,9 +207,15 @@ package-release-assets bin version="":
   esac
 
   if [[ -z "{{version}}" ]]; then
-    version=$(grep "^version" < $crate/Cargo.toml | head -n 1 | awk '{ print $3 }' | sed 's/\"//g')
+    version=$(grep "^version" < $crate_dir_name/Cargo.toml | \
+        head -n 1 | awk '{ print $3 }' | sed 's/\"//g')
   else
     version="{{version}}"
+  fi
+
+  if [[ -z "$version" ]]; then
+    echo "Error packaging $bin. The version number was not retrieved."
+    exit 1
   fi
 
   rm -rf deploy/$bin
@@ -219,6 +241,7 @@ upload-github-release-assets:
     "sn_node_manager"
     "sn_faucet"
     "sn_node_rpc_client"
+    "sn_node_launchpad"
   )
 
   commit_msg=$(git log -1 --pretty=%B)
@@ -255,8 +278,12 @@ upload-github-release-assets:
             bin_name="safenode_rpc_client"
             bucket="sn-node-rpc-client"
             ;;
+          sn_node_launchpad)
+            bin_name="node-launchpad"
+            bucket="sn-node-launchpad"
+            ;;
           *)
-            echo "The $crate is not supported"
+            echo "The $crate crate is not supported"
             exit 1
             ;;
         esac
@@ -300,6 +327,9 @@ upload-release-assets-to-s3 bin_name:
       ;;
     safenode_rpc_client)
       bucket="sn-node-rpc-client"
+      ;;
+    node-launchpad)
+      bucket="sn-node-launchpad"
       ;;
     *)
       echo "The {{bin_name}} binary is not supported"

@@ -9,16 +9,18 @@
 use eyre::{bail, OptionExt, Result};
 use lazy_static::lazy_static;
 use libp2p::PeerId;
-use sn_client::{send, Client};
-use sn_peers_acquisition::parse_peer_addr;
-use sn_protocol::{
-    node_registry::{get_local_node_registry_path, NodeRegistry},
-    safenode_manager_proto::NodeServiceRestartRequest,
-    safenode_proto::{NodeInfoRequest, RestartRequest},
-    test_utils::DeploymentInventory,
+use sn_client::{
+    acc_packet::{create_faucet_account_and_wallet, load_account_wallet_or_create_with_mnemonic},
+    send, Client,
 };
-use sn_transfers::{create_faucet_wallet, HotWallet, NanoTokens, Transfer};
+use sn_peers_acquisition::parse_peer_addr;
+use sn_protocol::safenode_proto::{NodeInfoRequest, RestartRequest};
+use sn_service_management::{
+    get_local_node_registry_path, safenode_manager_proto::NodeServiceRestartRequest, NodeRegistry,
+};
+use sn_transfers::{HotWallet, NanoTokens, Transfer};
 use std::{net::SocketAddr, path::Path};
+use test_utils::testnet::DeploymentInventory;
 use tokio::{
     sync::Mutex,
     time::{Duration, Instant},
@@ -32,7 +34,7 @@ use super::get_safenode_manager_rpc_client;
 
 /// This is a limited hard coded value as Droplet version has to contact the faucet to get the funds.
 /// This is limited to 10 requests to the faucet, where each request yields 100 SNT
-pub const INITIAL_WALLET_BALANCE: u64 = 10 * 100 * 1_000_000_000;
+pub const INITIAL_WALLET_BALANCE: u64 = 3 * 100 * 1_000_000_000;
 
 /// 100 SNT is added when `add_funds_to_wallet` is called.
 /// This is limited to 1 request to the faucet, where each request yields 100 SNT
@@ -50,7 +52,8 @@ lazy_static! {
 
 /// Load HotWallet from dir
 pub fn get_wallet(root_dir: &Path) -> HotWallet {
-    HotWallet::load_from(root_dir).expect("Wallet shall be successfully created.")
+    load_account_wallet_or_create_with_mnemonic(root_dir, None)
+        .expect("Wallet shall be successfully created.")
 }
 
 /// Get the node count
@@ -109,21 +112,11 @@ pub fn get_all_rpc_addresses(skip_genesis_for_droplet: bool) -> Result<Vec<Socke
     }
 }
 
-/// Get a new Client.
-/// If SN_INVENTORY flag is passed, the client is bootstrapped to the droplet network
-/// Else to the local network.
-pub async fn get_gossip_client() -> Client {
-    match DeploymentInventory::load() {
-        Ok(inventory) => Droplet::get_gossip_client(&inventory).await,
-        Err(_) => NonDroplet::get_gossip_client().await,
-    }
-}
-
 /// Adds funds to the provided to_wallet_dir
 /// If SN_INVENTORY flag is passed, the amount is retrieved from the faucet url
 /// else obtain it from the provided faucet HotWallet
 ///
-/// We obtain 100 SNT from the network per call. Use `get_gossip_client_and_wallet` during the initial setup which would
+/// We obtain 100 SNT from the network per call. Use `get_client_and_wallet` during the initial setup which would
 /// obtain 10*100 SNT
 pub async fn add_funds_to_wallet(client: &Client, to_wallet_dir: &Path) -> Result<HotWallet> {
     match DeploymentInventory::load() {
@@ -140,17 +133,17 @@ pub async fn add_funds_to_wallet(client: &Client, to_wallet_dir: &Path) -> Resul
 ///
 /// We get a maximum of 10*100 SNT from the network. This is hardcoded as the Droplet tests have the fetch the
 /// coins from the faucet and each request is limited to 100 SNT.
-pub async fn get_gossip_client_and_funded_wallet(root_dir: &Path) -> Result<(Client, HotWallet)> {
+pub async fn get_client_and_funded_wallet(root_dir: &Path) -> Result<(Client, HotWallet)> {
     match DeploymentInventory::load() {
         Ok(inventory) => {
-            let client = Droplet::get_gossip_client(&inventory).await;
+            let client = Droplet::get_client(&inventory).await;
             let local_wallet =
                 Droplet::get_funded_wallet(&client, root_dir, inventory.faucet_address, true)
                     .await?;
             Ok((client, local_wallet))
         }
         Err(_) => {
-            let client = NonDroplet::get_gossip_client().await;
+            let client = NonDroplet::get_client().await;
             let local_wallet = NonDroplet::get_funded_wallet(&client, root_dir, true).await?;
 
             Ok((client, local_wallet))
@@ -161,7 +154,7 @@ pub async fn get_gossip_client_and_funded_wallet(root_dir: &Path) -> Result<(Cli
 pub struct NonDroplet;
 impl NonDroplet {
     ///  Get a new Client for testing
-    pub async fn get_gossip_client() -> Client {
+    pub async fn get_client() -> Client {
         let secret_key = bls::SecretKey::random();
 
         let bootstrap_peers = if !cfg!(feature = "local-discovery") {
@@ -178,7 +171,7 @@ impl NonDroplet {
 
         println!("Client bootstrap with peer {bootstrap_peers:?}");
         info!("Client bootstrap with peer {bootstrap_peers:?}");
-        Client::new(secret_key, bootstrap_peers, true, None, None)
+        Client::new(secret_key, bootstrap_peers, None, None)
             .await
             .expect("Client shall be successfully created.")
     }
@@ -223,7 +216,7 @@ impl NonDroplet {
         info!("Loading faucet...");
         let now = Instant::now();
         for attempt in 1..LOAD_FAUCET_WALLET_RETRIES + 1 {
-            let faucet_wallet = create_faucet_wallet();
+            let faucet_wallet = create_faucet_account_and_wallet();
 
             let faucet_balance = faucet_wallet.balance();
             if !faucet_balance.is_zero() {
@@ -281,7 +274,7 @@ impl NonDroplet {
 pub struct Droplet;
 impl Droplet {
     /// Create a new client and bootstrap from the provided safe_peers
-    pub async fn get_gossip_client(inventory: &DeploymentInventory) -> Client {
+    pub async fn get_client(inventory: &DeploymentInventory) -> Client {
         let secret_key = bls::SecretKey::random();
 
         let mut bootstrap_peers = Vec::new();
@@ -301,7 +294,7 @@ impl Droplet {
 
         println!("Client bootstrap with peer {bootstrap_peers:?}");
         info!("Client bootstrap with peer {bootstrap_peers:?}");
-        Client::new(secret_key, Some(bootstrap_peers), true, None, None)
+        Client::new(secret_key, Some(bootstrap_peers), None, None)
             .await
             .expect("Client shall be successfully created.")
     }
@@ -316,7 +309,7 @@ impl Droplet {
         let _guard = FAUCET_WALLET_MUTEX.lock().await;
 
         let requests_to_faucet = if initial_wallet {
-            let requests_to_faucet = 10;
+            let requests_to_faucet = 3;
             assert_eq!(
                 requests_to_faucet * 100 * 1_000_000_000,
                 INITIAL_WALLET_BALANCE
@@ -388,14 +381,16 @@ impl Droplet {
     ) -> Result<()> {
         let mut rpc_client = get_safenode_manager_rpc_client(daemon_endpoint).await?;
 
-        let _response = rpc_client.restart_node_service(Request::new(NodeServiceRestartRequest {
-            peer_id: peer_id.to_bytes(),
-            delay_millis: 0,
-            retain_peer_id,
-        }));
+        let _response = rpc_client
+            .restart_node_service(Request::new(NodeServiceRestartRequest {
+                peer_id: peer_id.to_bytes(),
+                delay_millis: 0,
+                retain_peer_id,
+            }))
+            .await?;
 
-        println!("Node restart requested to RPC service at {daemon_endpoint}");
-        info!("Node restart requested to RPC service at {daemon_endpoint}");
+        println!("Node restart requested to safenodemand {daemon_endpoint}");
+        info!("Node restart requested to safenodemand {daemon_endpoint}");
 
         Ok(())
     }

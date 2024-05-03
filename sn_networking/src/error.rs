@@ -7,7 +7,6 @@
 // permissions and limitations relating to use of the SAFE Network Software.
 
 use libp2p::{
-    gossipsub::{PublishError, SubscriptionError},
     kad::{self, QueryId, Record},
     request_response::{OutboundFailure, OutboundRequestId},
     swarm::DialError,
@@ -25,7 +24,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use xor_name::XorName;
 
-pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
+pub(super) type Result<T, E = NetworkError> = std::result::Result<T, E>;
 
 /// GetRecord Query errors
 #[derive(Error)]
@@ -88,7 +87,7 @@ impl Debug for GetRecordError {
 /// Network Errors
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
-pub enum Error {
+pub enum NetworkError {
     #[error("Dial Error")]
     DialError(#[from] DialError),
 
@@ -104,8 +103,10 @@ pub enum Error {
     #[error("SnProtocol Error: {0}")]
     ProtocolError(#[from] sn_protocol::error::Error),
 
-    #[error("Transfer Error {0}.")]
-    Transfers(#[from] sn_transfers::WalletError),
+    #[error("Wallet Error {0}")]
+    Wallet(#[from] sn_transfers::WalletError),
+    #[error("Transfer Error {0}")]
+    Transfer(#[from] sn_transfers::TransferError),
 
     #[error("Failed to sign the message with the PeerId keypair")]
     SigningFailed(#[from] libp2p::identity::SigningError),
@@ -150,25 +151,12 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    // ---------- GossipSub Errors
-    #[error("Could ont build the gossipsub config: {0}")]
-    GossipsubConfigError(String),
-
-    #[error("Gossipsub publish Error: {0}")]
-    GossipsubPublishError(#[from] PublishError),
-
-    #[error("Gossipsub subscribe Error: {0}")]
-    GossipsubSubscriptionError(#[from] SubscriptionError),
-
     // ---------- Internal Network Errors
     #[error("Could not get enough peers ({required}) to satisfy the request, found {found}")]
     NotEnoughPeers { found: usize, required: usize },
 
     #[error("Close group size must be a non-zero usize")]
     InvalidCloseGroupSize,
-
-    #[error("Failed to pop from front of CircularVec")]
-    CircularVecPopFrontError,
 
     #[error("Node Listen Address was not provided during construction")]
     ListenAddressNotProvided,
@@ -195,6 +183,9 @@ pub enum Error {
 
     #[error("Outgoing response has been dropped due to a conn being closed or timeout: {0}")]
     OutgoingResponseDropped(Response),
+
+    #[error("Error setting up behaviour: {0}")]
+    BahviourErr(String),
 }
 
 #[cfg(test)]

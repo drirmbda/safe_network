@@ -5,6 +5,87 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.105.3](https://github.com/maidsafe/safe_network/compare/sn_node-v0.105.2...sn_node-v0.105.3) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_client
+
+## [0.105.2](https://github.com/joshuef/safe_network/compare/sn_node-v0.105.1...sn_node-v0.105.2) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_service_management
+
+## [0.105.1](https://github.com/joshuef/safe_network/compare/sn_node-v0.105.0...sn_node-v0.105.1) - 2024-03-28
+
+### Added
+- *(transfers)* implement WalletApi to expose common methods
+
+### Fixed
+- *(uploader)* clarify the use of root and wallet dirs
+
+## [0.105.0](https://github.com/joshuef/safe_network/compare/sn_node-v0.104.41...sn_node-v0.105.0) - 2024-03-27
+
+### Added
+- *(uploader)* allow either chunk or chunk path to be used
+- *(client)* use the new Uploader insetead of FilesUpload
+- make logging simpler to use
+- *(transfers)* enable client to check if a quote has expired
+- *(networking)* add NodeIssue for tracking bad node shunning
+- [**breaking**] remove gossip code
+- *(transfers)* [**breaking**] support multiple payments for the same xorname
+- use Arc inside Client, Network to reduce clone cost
+- provide `--metrics-port` arg for `add` cmd
+- *(network)* filter out peers when returning store cost
+- *(faucet)* rate limit based upon wallet locks
+
+### Fixed
+- *(register)* permissions verification was not being made by some Register APIs
+- *(node)* fetching new data shall not cause timed_out immediately
+- *(test)* generate unique temp dir to avoid read outdated data
+- *(register)* shortcut permissions check when anyone can write to Register
+
+### Other
+- *(node)* refactor pricing metrics
+- *(node)* reduce bad_node check concureent queries
+- *(uploader)* remove FilesApi dependency
+- *(uploader)* implement UploaderInterface for easier testing
+- *(register)* minor simplification in Register Permissions implementation
+- lower some networking log levels
+- *(node)* loose bad node detection criteria
+- *(node)* optimization to reduce logging
+- *(uploader)* initial test setup for uploader
+
+## [0.104.41](https://github.com/joshuef/safe_network/compare/sn_node-v0.104.40...sn_node-v0.104.41) - 2024-03-21
+
+### Added
+- dag error recording
+- *(protocol)* add rpc to set node log level on the fly
+- *(log)* set log levels on the fly
+- refactor DAG, improve error management and security
+
+### Fixed
+- *(node)* get_closest error not trigger bad_node report
+
+### Other
+- *(node)* reduce bad_nodes check resource usage
+
+## [0.104.39](https://github.com/joshuef/safe_network/compare/sn_node-v0.104.38...sn_node-v0.104.39) - 2024-03-14
+
+### Added
+- refactor spend validation
+
+### Fixed
+- *(test)* await on the restart node rpc call
+- dont stop spend verification at spend error, generalise spend serde
+- put validation network spends errors management
+
+### Other
+- store test utils under a new crate
+- move DeploymentInventory to test utils
+- improve code quality
+- new `sn_service_management` crate
+- *(release)* sn_transfers-v0.16.3/sn_cli-v0.89.82
+
 ## [0.104.38](https://github.com/joshuef/safe_network/compare/sn_node-v0.104.37-alpha.0...sn_node-v0.104.38) - 2024-03-08
 
 ### Other

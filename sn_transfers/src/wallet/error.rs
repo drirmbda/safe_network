@@ -6,11 +6,10 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use std::collections::BTreeSet;
+use crate::UniquePubkey;
+use std::{collections::BTreeSet, path::PathBuf};
 use thiserror::Error;
 use xor_name::XorName;
-
-use crate::UniquePubkey;
 
 /// Specialisation of `std::Result`.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -18,6 +17,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Transfer errors.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The cashnotes that were attempted to be spent have already been spent to another address
+    #[error("Attempted to reload a wallet from disk, but the disk wallet is not the same as the current wallet. Wallet path: {0}")]
+    CurrentAndLoadedKeyMismatch(PathBuf),
+
     /// The cashnotes that were attempted to be spent have already been spent to another address
     #[error("Double spend attempted with cashnotes: {0:?}")]
     DoubleSpendAttemptedForCashNotes(BTreeSet<UniquePubkey>),
@@ -49,6 +52,9 @@ pub enum Error {
     /// Main pub key not found when loading wallet from path
     #[error("Main pub key not found: {0:#?}")]
     PubkeyNotFound(std::path::PathBuf),
+    /// Main secret key not found when loading wallet from path
+    #[error("Main secret key not found: {0:#?}")]
+    MainSecretKeyNotFound(std::path::PathBuf),
     /// Failed to parse bytes into a bls key
     #[error("Failed to parse bls key")]
     FailedToParseBlsKey,
@@ -67,10 +73,16 @@ pub enum Error {
     /// No cached payment found for address
     #[error("No ongoing payment found for address {0:?}")]
     NoPaymentForAddress(XorName),
+    /// The payment Quote has expired.
+    #[error("The payment quote made for {0:?} has expired")]
+    QuoteExpired(XorName),
 
+    /// DAG error
+    #[error("DAG error: {0}")]
+    Dag(String),
     /// Transfer error
     #[error("Transfer error: {0}")]
-    Transfer(#[from] crate::Error),
+    Transfer(#[from] crate::TransferError),
     /// Bls error
     #[error("Bls error: {0}")]
     Bls(#[from] bls::error::Error),

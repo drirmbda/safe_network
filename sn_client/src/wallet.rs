@@ -16,8 +16,9 @@ use sn_networking::target_arch::Instant;
 use sn_networking::{GetRecordError, PayeeQuote};
 use sn_protocol::NetworkAddress;
 use sn_transfers::{
-    CashNote, DerivationIndex, HotWallet, MainPubkey, NanoTokens, Payment, PaymentQuote,
+    CashNote, CashNoteOutputDetails, HotWallet, MainPubkey, NanoTokens, Payment, PaymentQuote,
     SignedSpend, SpendAddress, Transaction, Transfer, UniquePubkey, WalletError, WalletResult,
+    CASHNOTE_PURPOSE_OF_TRANSFER,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -28,6 +29,8 @@ use tokio::{
     time::{sleep, Duration},
 };
 use xor_name::XorName;
+
+const MAX_RESEND_PENDING_TX_ATTEMPTS: usize = 10;
 
 /// A wallet client can be used to send and receive tokens to and from other wallets.
 pub struct WalletClient {
@@ -57,7 +60,7 @@ impl WalletClient {
     /// use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -77,7 +80,7 @@ impl WalletClient {
     /// # use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -98,7 +101,7 @@ impl WalletClient {
     /// # use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -119,7 +122,7 @@ impl WalletClient {
     /// # use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -129,13 +132,11 @@ impl WalletClient {
     pub fn unconfirmed_spend_requests_exist(&self) -> bool {
         self.wallet.unconfirmed_spend_requests_exist()
     }
-    /// Get unconfirmed transactions
-    //TODO: Unused
-    pub fn unconfirmed_spend_requests(&self) -> &BTreeSet<SignedSpend> {
-        self.wallet.unconfirmed_spend_requests()
-    }
 
-    ///  Returns the Cached Payment for a provided NetworkAddress.
+    /// Returns the most recent cached Payment for a provided NetworkAddress. This function does not check if the
+    /// quote has expired or not. Use get_non_expired_payment_for_addr if you want to get a non expired one.
+    ///
+    /// If multiple payments have been made to the same address, then we pick the last one as it is the most recent.
     ///
     /// # Arguments
     /// * `address` - The [`NetworkAddress`].
@@ -150,7 +151,7 @@ impl WalletClient {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
     /// # use std::io::Bytes;
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// use libp2p_identity::PeerId;
@@ -158,30 +159,81 @@ impl WalletClient {
     ///
     /// let mut wallet_client = WalletClient::new(client, wallet);
     /// let network_address = NetworkAddress::from_peer(PeerId::random());
-    /// let payment = wallet_client.get_payment_for_addr(&network_address)?;
+    /// let payment = wallet_client.get_recent_payment_for_addr(&network_address)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_payment_for_addr(
+    pub fn get_recent_payment_for_addr(
         &self,
         address: &NetworkAddress,
     ) -> WalletResult<(Payment, PeerId)> {
-        match &address.as_xorname() {
-            Some(xorname) => {
-                let payment_details = self
-                    .wallet
-                    .get_cached_payment_for_xorname(xorname)
-                    .ok_or(WalletError::NoPaymentForAddress(*xorname))?;
-                let payment = payment_details.to_payment();
-                debug!("Payment retrieved for {xorname:?} from wallet: {payment:?}");
-                info!("Payment retrieved for {xorname:?} from wallet");
-                let peer_id = PeerId::from_bytes(&payment_details.peer_id_bytes)
-                    .map_err(|_| WalletError::NoPaymentForAddress(*xorname))?;
+        let xorname = address
+            .as_xorname()
+            .ok_or(WalletError::InvalidAddressType)?;
+        let payment_detail = self.wallet.api().get_recent_payment(&xorname)?;
 
-                Ok((payment, peer_id))
-            }
-            None => Err(WalletError::InvalidAddressType),
-        }
+        let payment = payment_detail.to_payment();
+        trace!("Payment retrieved for {xorname:?} from wallet: {payment:?}");
+        let peer_id = PeerId::from_bytes(&payment_detail.peer_id_bytes)
+            .map_err(|_| WalletError::NoPaymentForAddress(xorname))?;
+
+        Ok((payment, peer_id))
+    }
+
+    ///  Returns the all cached Payment for a provided NetworkAddress.
+    ///
+    /// # Arguments
+    /// * `address` - The [`NetworkAddress`].
+    ///
+    /// # Example
+    /// ```no_run
+    /// // Getting the payment for an address using a random PeerId
+    /// # use sn_client::{Client, WalletClient, Error};
+    /// # use tempfile::TempDir;
+    /// # use bls::SecretKey;
+    /// # use sn_transfers::{HotWallet, MainSecretKey};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(),Error>{
+    /// # use std::io::Bytes;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
+    /// # let tmp_path = TempDir::new()?.path().to_owned();
+    /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
+    /// use libp2p_identity::PeerId;
+    /// use sn_protocol::NetworkAddress;
+    ///
+    /// let mut wallet_client = WalletClient::new(client, wallet);
+    /// let network_address = NetworkAddress::from_peer(PeerId::random());
+    /// let payments = wallet_client.get_all_payments_for_addr(&network_address)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_all_payments_for_addr(
+        &self,
+        address: &NetworkAddress,
+    ) -> WalletResult<Vec<(Payment, PeerId)>> {
+        let xorname = address
+            .as_xorname()
+            .ok_or(WalletError::InvalidAddressType)?;
+        let payment_details = self.wallet.api().get_all_payments(&xorname)?;
+
+        let payments = payment_details
+            .into_iter()
+            .map(|details| {
+                let payment = details.to_payment();
+
+                match PeerId::from_bytes(&details.peer_id_bytes) {
+                    Ok(peer_id) => Ok((payment, peer_id)),
+                    Err(_) => Err(WalletError::NoPaymentForAddress(xorname)),
+                }
+            })
+            .collect::<WalletResult<Vec<_>>>()?;
+
+        trace!(
+            "{} Payment retrieved for {xorname:?} from wallet: {payments:?}",
+            payments.len()
+        );
+
+        Ok(payments)
     }
 
     /// Remove the payment for a given network address from disk.
@@ -199,7 +251,7 @@ impl WalletClient {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
     /// # use std::io::Bytes;
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// use libp2p_identity::PeerId;
@@ -214,17 +266,11 @@ impl WalletClient {
     pub fn remove_payment_for_addr(&self, address: &NetworkAddress) -> WalletResult<()> {
         match &address.as_xorname() {
             Some(xorname) => {
-                self.wallet.remove_payment_for_xorname(xorname);
+                self.wallet.api().remove_payment_transaction(xorname);
                 Ok(())
             }
             None => Err(WalletError::InvalidAddressType),
         }
-    }
-
-    /// Remove CashNote from available_cash_notes
-    //TODO: Unused
-    pub fn mark_note_as_spent(&mut self, cash_note_key: UniquePubkey) {
-        self.wallet.mark_notes_as_spent(&[cash_note_key]);
     }
 
     /// Send tokens to another wallet. Can also verify the store has been successful.
@@ -244,7 +290,7 @@ impl WalletClient {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
     /// # use std::io::Bytes;
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// use sn_transfers::NanoTokens;
@@ -261,7 +307,10 @@ impl WalletClient {
         to: MainPubkey,
         verify_store: bool,
     ) -> WalletResult<CashNote> {
-        let created_cash_notes = self.wallet.local_send(vec![(amount, to)], None)?;
+        let created_cash_notes = self.wallet.local_send(
+            vec![(CASHNOTE_PURPOSE_OF_TRANSFER.to_string(), amount, to)],
+            None,
+        )?;
 
         // send to network
         if let Err(error) = self
@@ -296,13 +345,12 @@ impl WalletClient {
     /// Send signed spends to another wallet.
     /// Can optionally verify if the store has been successful.
     /// Verification will be attempted via GET request through a Spend on the network.
-    // TODO: Unused. Private method.
     async fn send_signed_spends(
         &mut self,
         signed_spends: BTreeSet<SignedSpend>,
         tx: Transaction,
         change_id: UniquePubkey,
-        output_details: BTreeMap<UniquePubkey, (MainPubkey, DerivationIndex)>,
+        output_details: BTreeMap<UniquePubkey, CashNoteOutputDetails>,
         verify_store: bool,
     ) -> WalletResult<CashNote> {
         let created_cash_notes =
@@ -360,7 +408,7 @@ impl WalletClient {
     /// use sn_protocol::NetworkAddress;
     /// use libp2p_identity::PeerId;
     /// use sn_registers::{Permissions, RegisterAddress};
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// # let mut rng = rand::thread_rng();
@@ -377,7 +425,7 @@ impl WalletClient {
     ) -> WalletResult<PayeeQuote> {
         self.client
             .network
-            .get_store_costs_from_network(address)
+            .get_store_costs_from_network(address, vec![])
             .await
             .map_err(|error| WalletError::CouldNotSendMoney(error.to_string()))
     }
@@ -401,7 +449,7 @@ impl WalletClient {
     /// # use xor_name::XorName;
     /// use sn_protocol::NetworkAddress;
     /// use sn_registers::{Permissions, RegisterAddress};
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client.clone(), wallet);
@@ -446,7 +494,6 @@ impl WalletClient {
     /// Existing chunks will have the store cost set to Zero.
     /// The payment procedure shall be skipped, and the chunk upload as well.
     /// Hence the list of existing chunks will be returned.
-    // TODO: Used only once in current file: Set to Private. No Docs issued.
     async fn pay_for_storage_once(
         &mut self,
         content_addrs: impl Iterator<Item = NetworkAddress>,
@@ -459,7 +506,7 @@ impl WalletClient {
             tasks.spawn(async move {
                 let cost = client
                     .network
-                    .get_store_costs_from_network(content_addr.clone())
+                    .get_store_costs_from_network(content_addr.clone(), vec![])
                     .await
                     .map_err(|error| WalletError::CouldNotSendMoney(error.to_string()));
 
@@ -535,7 +582,7 @@ impl WalletClient {
     /// # use std::collections::BTreeMap;
     /// use xor_name::XorName;
     /// use sn_transfers::{MainPubkey, Payment, PaymentQuote};
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -549,17 +596,8 @@ impl WalletClient {
         verify_store: bool,
     ) -> WalletResult<(NanoTokens, NanoTokens)> {
         // Before wallet progress, there shall be no `unconfirmed_spend_requests`
-        // Here, just re-upload again. The caller shall carry out a re-try later on.
-        if self.wallet.unconfirmed_spend_requests_exist() {
-            info!("Pre-Unconfirmed transactions exist. Resending in 1 second...");
-            sleep(Duration::from_secs(1)).await;
-            self.resend_pending_transactions(verify_store).await;
-
-            return Err(WalletError::CouldNotSendMoney(
-                "Wallet has pre-unconfirmed transactions. Resend, and try again.".to_string(),
-            ));
-        }
-
+        self.resend_pending_transaction_until_success(verify_store)
+            .await?;
         let start = Instant::now();
         let total_cost = self.wallet.local_send_storage_payment(cost_map)?;
 
@@ -621,7 +659,6 @@ impl WalletClient {
 
     /// Resend failed transactions. This can optionally verify the store has been successful.
     /// This will attempt to GET the cash_note from the network.
-    // TODO: Used only once in current file: Set to Private. No Docs issued.
     async fn resend_pending_transactions(&mut self, verify_store: bool) {
         if self
             .client
@@ -633,10 +670,36 @@ impl WalletClient {
             .is_ok()
         {
             self.wallet.clear_confirmed_spend_requests();
-            // We might want to be _really_ sure and do the below
-            // as well, but it's not necessary.
-            // use crate::domain::wallet::VerifyingClient;
-            // client.verify(tx_hash).await.ok();
+        }
+    }
+
+    /// Try resending failed transactions multiple times until it succeeds or until we reach max attempts.
+    async fn resend_pending_transaction_until_success(
+        &mut self,
+        verify_store: bool,
+    ) -> WalletResult<()> {
+        let mut did_error = false;
+        // Wallet shall be all clear to progress forward.
+        let mut attempts = 0;
+        while self.wallet.unconfirmed_spend_requests_exist() {
+            info!("Pre-Unconfirmed transactions exist, sending again after 1 second...");
+            sleep(Duration::from_secs(1)).await;
+            self.resend_pending_transactions(verify_store).await;
+
+            if attempts > MAX_RESEND_PENDING_TX_ATTEMPTS {
+                // save the error state, but break out of the loop so we can save
+                did_error = true;
+                break;
+            }
+
+            attempts += 1;
+        }
+
+        if did_error {
+            error!("Wallet has pre-unconfirmed transactions, can't progress further.");
+            Err(WalletError::UnconfirmedTxAfterRetries)
+        } else {
+            Ok(())
         }
     }
 
@@ -652,7 +715,7 @@ impl WalletClient {
     /// # use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -677,7 +740,7 @@ impl WalletClient {
     /// # use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// # let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// # let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// # let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let mut wallet_client = WalletClient::new(client, wallet);
@@ -707,7 +770,7 @@ impl Client {
     /// use sn_transfers::{HotWallet, MainSecretKey};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(),Error>{
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// // An example of sending storage payment transfers over the network with validation
@@ -745,10 +808,10 @@ impl Client {
         let mut double_spent_keys = BTreeSet::new();
         for (spend_key, spend_attempt_result) in join_all(tasks).await {
             match spend_attempt_result {
-                Err(Error::Network(sn_networking::Error::GetRecordError(
+                Err(Error::Network(sn_networking::NetworkError::GetRecordError(
                     GetRecordError::RecordDoesNotMatch(_),
                 )))
-                | Err(Error::Network(sn_networking::Error::GetRecordError(
+                | Err(Error::Network(sn_networking::NetworkError::GetRecordError(
                     GetRecordError::SplitRecord { .. },
                 ))) => {
                     warn!(
@@ -805,7 +868,7 @@ impl Client {
     /// # async fn main() -> Result<(),Error>{
     /// use tracing::error;
     /// use sn_transfers::Transfer;
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let transfer = Transfer::from_hex("13abc").unwrap();
@@ -853,7 +916,9 @@ impl Client {
             let res = result.map_err(|e| WalletError::FailedToGetSpend(format!("{e}")))?;
             match res {
                 // if we get a RecordNotFound, it means the CashNote is not spent, which is good
-                Err(sn_networking::Error::GetRecordError(GetRecordError::RecordNotFound)) => (),
+                Err(sn_networking::NetworkError::GetRecordError(
+                    GetRecordError::RecordNotFound,
+                )) => (),
                 // if we get a spend, it means the CashNote is already spent
                 Ok(s) => {
                     warn!(
@@ -894,7 +959,7 @@ impl Client {
     /// # async fn main() -> Result<(),Error>{
     /// use tracing::error;
     /// use sn_transfers::Transfer;
-    /// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+    /// let client = Client::new(SecretKey::random(), None, None, None).await?;
     /// # let tmp_path = TempDir::new()?.path().to_owned();
     /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
     /// let transfer = Transfer::from_hex("").unwrap();
@@ -912,7 +977,7 @@ impl Client {
         // and compare them to the spends in the cash_note, to know if the
         // transfer is considered valid in the network.
         let mut tasks = Vec::new();
-        for spend in &cash_note.signed_spends {
+        for spend in &cash_note.parent_spends {
             let address = SpendAddress::from_unique_pubkey(spend.unique_pubkey());
             debug!(
                 "Getting spend for pubkey {:?} from network at {address:?}",
@@ -930,7 +995,7 @@ impl Client {
 
         // If all the spends in the cash_note are the same as the ones in the network,
         // we have successfully verified that the cash_note is globally recognised and therefor valid.
-        if received_spends == cash_note.signed_spends {
+        if received_spends == cash_note.parent_spends {
             return Ok(());
         }
         Err(WalletError::CouldNotVerifyTransfer(
@@ -960,7 +1025,7 @@ impl Client {
 /// use tracing::error;
 /// use sn_client::send;
 /// use sn_transfers::Transfer;
-/// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+/// let client = Client::new(SecretKey::random(), None, None, None).await?;
 /// # let tmp_path = TempDir::new()?.path().to_owned();
 /// let mut first_wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
 /// let mut second_wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
@@ -987,29 +1052,13 @@ pub async fn send(
 
     let mut wallet_client = WalletClient::new(client.clone(), from);
 
-    let mut did_error = false;
-    // Wallet shall be all clear to progress forward.
-    let mut attempts = 0;
-    while wallet_client.unconfirmed_spend_requests_exist() {
-        info!("Pre-Unconfirmed transactions exist, sending again after 1 second...");
-        sleep(Duration::from_secs(1)).await;
-        wallet_client
-            .resend_pending_transactions(verify_store)
-            .await;
-
-        if attempts > 10 {
-            // save the error state, but break out of the loop so we can save
-            did_error = true;
-            break;
-        }
-
-        attempts += 1;
-    }
-
-    if did_error {
-        error!("Wallet has pre-unconfirmed transactions, can't progress further.");
+    if let Err(err) = wallet_client
+        .resend_pending_transaction_until_success(verify_store)
+        .await
+    {
         println!("Wallet has pre-unconfirmed transactions, can't progress further.");
-        return Err(WalletError::UnconfirmedTxAfterRetries.into());
+        warn!("Wallet has pre-unconfirmed transactions, can't progress further.");
+        return Err(err.into());
     }
 
     let new_cash_note = wallet_client
@@ -1020,31 +1069,9 @@ pub async fn send(
             err
         })?;
 
-    if verify_store {
-        attempts = 0;
-        while wallet_client.unconfirmed_spend_requests_exist() {
-            info!("Unconfirmed txs exist, sending again after 1 second...");
-            sleep(Duration::from_secs(1)).await;
-            wallet_client
-                .resend_pending_transactions(verify_store)
-                .await;
-
-            if attempts > 10 {
-                // save the error state, but break out of the loop so we can save
-                did_error = true;
-                break;
-            }
-
-            attempts += 1;
-        }
-    }
-
-    if did_error {
-        wallet_client
-            .into_wallet()
-            .store_unconfirmed_spend_requests()?;
-        return Err(WalletError::UnconfirmedTxAfterRetries.into());
-    }
+    wallet_client
+        .resend_pending_transaction_until_success(verify_store)
+        .await?;
 
     wallet_client
         .into_wallet()
@@ -1063,7 +1090,7 @@ pub async fn send(
 /// * signed_spends - [BTreeSet]<[SignedSpend]>,
 /// * transaction - [Transaction],
 /// * change_id - [UniquePubkey],
-/// * output_details - [BTreeMap]<[UniquePubkey], ([MainPubkey], [DerivationIndex])>,
+/// * output_details - [BTreeMap]<[UniquePubkey], CashNoteOutputDetails>,
 /// * verify_store - Boolean. Set to true for mandatory verification via a GET request through a Spend on the network.
 ///
 /// # Return value
@@ -1079,7 +1106,7 @@ pub async fn send(
 /// use std::collections::{BTreeMap, BTreeSet};
 /// use tracing::error;
 /// use sn_transfers::{Transaction, Transfer, UniquePubkey};
-/// let client = Client::new(SecretKey::random(), None, false, None, None).await?;
+/// let client = Client::new(SecretKey::random(), None, None, None).await?;
 /// # let tmp_path = TempDir::new()?.path().to_owned();
 /// let mut wallet = HotWallet::load_from_path(&tmp_path,Some(MainSecretKey::new(SecretKey::random())))?;
 /// let transaction = Transaction {inputs: Vec::new(),outputs: Vec::new(),};
@@ -1105,34 +1132,18 @@ pub async fn broadcast_signed_spends(
     signed_spends: BTreeSet<SignedSpend>,
     tx: Transaction,
     change_id: UniquePubkey,
-    output_details: BTreeMap<UniquePubkey, (MainPubkey, DerivationIndex)>,
+    output_details: BTreeMap<UniquePubkey, CashNoteOutputDetails>,
     verify_store: bool,
 ) -> WalletResult<CashNote> {
     let mut wallet_client = WalletClient::new(client.clone(), from);
 
-    let mut did_error = false;
     // Wallet shall be all clear to progress forward.
-    let mut attempts = 0;
-    while wallet_client.unconfirmed_spend_requests_exist() {
-        info!("Pre-Unconfirmed txs exist, sending again after 1 second...");
-        sleep(Duration::from_secs(1)).await;
-        wallet_client
-            .resend_pending_transactions(verify_store)
-            .await;
-
-        if attempts > 10 {
-            // save the error state, but break out of the loop so we can save
-            did_error = true;
-            break;
-        }
-
-        attempts += 1;
-    }
-
-    if did_error {
-        error!("Wallet has pre-unconfirmed txs, cann't progress further.");
-        println!("Wallet has pre-unconfirmed txs, cann't progress further.");
-        return Err(WalletError::UnconfirmedTxAfterRetries);
+    if let Err(err) = wallet_client
+        .resend_pending_transaction_until_success(verify_store)
+        .await
+    {
+        println!("Wallet has pre-unconfirmed transactions, can't progress further.");
+        return Err(err);
     }
 
     let new_cash_note = wallet_client
@@ -1143,31 +1154,9 @@ pub async fn broadcast_signed_spends(
             err
         })?;
 
-    if verify_store {
-        attempts = 0;
-        while wallet_client.unconfirmed_spend_requests_exist() {
-            info!("Unconfirmed txs exist, sending again after 1 second...");
-            sleep(Duration::from_secs(1)).await;
-            wallet_client
-                .resend_pending_transactions(verify_store)
-                .await;
-
-            if attempts > 10 {
-                // save the error state, but break out of the loop so we can save
-                did_error = true;
-                break;
-            }
-
-            attempts += 1;
-        }
-    }
-
-    if did_error {
-        wallet_client
-            .into_wallet()
-            .store_unconfirmed_spend_requests()?;
-        return Err(WalletError::UnconfirmedTxAfterRetries);
-    }
+    wallet_client
+        .resend_pending_transaction_until_success(verify_store)
+        .await?;
 
     wallet_client
         .into_wallet()

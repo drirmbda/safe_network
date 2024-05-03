@@ -6,6 +6,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/maidsafe/safe_network/compare/sn_node_rpc_client-v0.6.2...sn_node_rpc_client-v0.6.3) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_client
+
+## [0.6.2](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.6.1...sn_node_rpc_client-v0.6.2) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_service_management
+
+## [0.6.1](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.6.0...sn_node_rpc_client-v0.6.1) - 2024-03-28
+
+### Other
+- updated the following local packages: sn_client, sn_transfers, sn_node
+
+## [0.6.0](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.5.1...sn_node_rpc_client-v0.6.0) - 2024-03-27
+
+### Added
+- make logging simpler to use
+- [**breaking**] remove gossip code
+
+## [0.5.1](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.5.0...sn_node_rpc_client-v0.5.1) - 2024-03-21
+
+### Added
+- *(protocol)* add rpc to set node log level on the fly
+
+## [0.5.0](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.4.70...sn_node_rpc_client-v0.5.0) - 2024-03-14
+
+### Fixed
+- *(rpc_client)* revert to old binary name
+- *(deps)* add missing service management dep
+
+### Other
+- [**breaking**] uniform service management
+- *(release)* sn_transfers-v0.16.3/sn_cli-v0.89.82
+
 ## [0.4.70](https://github.com/joshuef/safe_network/compare/sn_node_rpc_client-v0.4.69-alpha.0...sn_node_rpc_client-v0.4.70) - 2024-03-08
 
 ### Other

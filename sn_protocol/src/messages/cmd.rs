@@ -10,7 +10,7 @@
 use crate::{storage::RecordType, NetworkAddress};
 use serde::{Deserialize, Serialize};
 // TODO: remove this dependency and define these types herein.
-pub use sn_transfers::Hash;
+pub use sn_transfers::{Hash, PaymentQuote};
 
 /// Data and CashNote cmds - recording spends or creating, updating, and removing data.
 ///
@@ -30,6 +30,17 @@ pub enum Cmd {
         /// Keys of copy that shall be replicated.
         keys: Vec<(NetworkAddress, RecordType)>,
     },
+    /// Write operation to notify nodes a list of PaymentQuote collected.
+    QuoteVerification {
+        target: NetworkAddress,
+        quotes: Vec<(NetworkAddress, PaymentQuote)>,
+    },
+    /// Notify the peer it is now being considered as BAD due to the included behaviour
+    PeerConsideredAsBad {
+        detected_by: NetworkAddress,
+        bad_peer: NetworkAddress,
+        bad_behaviour: String,
+    },
 }
 
 impl std::fmt::Debug for Cmd {
@@ -43,6 +54,21 @@ impl std::fmt::Debug for Cmd {
                     .field("first_ten_keys", &first_ten_keys)
                     .finish()
             }
+            Cmd::QuoteVerification { target, quotes } => f
+                .debug_struct("Cmd::QuoteVerification")
+                .field("target", target)
+                .field("quotes_len", &quotes.len())
+                .finish(),
+            Cmd::PeerConsideredAsBad {
+                detected_by,
+                bad_peer,
+                bad_behaviour,
+            } => f
+                .debug_struct("Cmd::PeerConsideredAsBad")
+                .field("detected_by", detected_by)
+                .field("bad_peer", bad_peer)
+                .field("bad_behaviour", bad_behaviour)
+                .finish(),
         }
     }
 }
@@ -52,6 +78,8 @@ impl Cmd {
     pub fn dst(&self) -> NetworkAddress {
         match self {
             Cmd::Replicate { holder, .. } => holder.clone(),
+            Cmd::QuoteVerification { target, .. } => target.clone(),
+            Cmd::PeerConsideredAsBad { bad_peer, .. } => bad_peer.clone(),
         }
     }
 }
@@ -66,6 +94,22 @@ impl std::fmt::Display for Cmd {
                     holder.as_peer_id(),
                     keys.len()
                 )
+            }
+            Cmd::QuoteVerification { target, quotes } => {
+                write!(
+                    f,
+                    "Cmd::QuoteVerification(sent to {target:?} has {} quotes)",
+                    quotes.len()
+                )
+            }
+            Cmd::PeerConsideredAsBad {
+                detected_by,
+                bad_peer,
+                bad_behaviour,
+            } => {
+                write!(
+                    f,
+                    "Cmd::PeerConsideredAsBad({detected_by:?} consider peer {bad_peer:?} as bad, due to {bad_behaviour:?})")
             }
         }
     }

@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.25](https://github.com/joshuef/safe_network/compare/sn_logging-v0.2.24...sn_logging-v0.2.25) - 2024-03-27
+
+### Added
+- make logging simpler to use
+
+### Fixed
+- logging, adapt program name
+
+### Other
+- fix typo
+- adapt client name for safe cli cmd
+
+## [0.2.24](https://github.com/joshuef/safe_network/compare/sn_logging-v0.2.23...sn_logging-v0.2.24) - 2024-03-21
+
+### Added
+- *(log)* set log levels on the fly
+
+### Other
+- *(log)* add test to verify log reload functionality
+
+## [0.2.23](https://github.com/joshuef/safe_network/compare/sn_logging-v0.2.22...sn_logging-v0.2.23) - 2024-03-14
+
+### Other
+- *(api)* make logging::Error public
+
 ## [0.2.21](https://github.com/maidsafe/safe_network/compare/sn_logging-v0.2.20...sn_logging-v0.2.21) - 2024-02-08
 
 ### Other

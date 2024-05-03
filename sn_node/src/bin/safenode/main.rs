@@ -16,7 +16,7 @@ use eyre::{eyre, Result};
 use libp2p::{identity::Keypair, PeerId};
 #[cfg(feature = "metrics")]
 use sn_logging::metrics::init_metrics;
-use sn_logging::{LogFormat, LogOutputDest};
+use sn_logging::{Level, LogFormat, LogOutputDest, ReloadHandle};
 use sn_node::{Marker, NodeBuilder, NodeEvent, NodeEventsReceiver};
 use sn_peers_acquisition::{get_peers_from_args, PeersArgs};
 use sn_protocol::{node::get_safenode_root_dir, node_rpc::NodeCtrl};
@@ -34,7 +34,6 @@ use tokio::{
     time::sleep,
 };
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_core::Level;
 
 #[derive(Debug, Clone)]
 pub enum LogOutputDestArg {
@@ -68,6 +67,13 @@ pub fn parse_log_output(val: &str) -> Result<LogOutputDestArg> {
 #[derive(Parser, Debug)]
 #[clap(name = "safenode cli", version = env!("CARGO_PKG_VERSION"))]
 struct Opt {
+    /// Specify whether the node is operating from a home network and situated behind a NAT without port forwarding
+    /// capabilities. Setting this to true, activates hole-punching to facilitate direct connections from other nodes.
+    ///
+    /// If this not enabled and you're behind a NAT, the node is terminated.
+    #[clap(long, default_value_t = false)]
+    home_network: bool,
+
     /// Specify the logging output destination.
     ///
     /// Valid values are "stdout", "data-dir", or a custom path.
@@ -144,10 +150,14 @@ struct Opt {
     #[clap(long)]
     local: bool,
 
+    /// Specify the owner(readable discord user name).
+    #[clap(long)]
+    owner: String,
+
     #[cfg(feature = "open-metrics")]
-    /// Specify the port to start the OpenMetrics Server in.
+    /// Specify the port for the OpenMetrics server.
     ///
-    /// The special value `0` will cause the OS to assign a random port.
+    /// If not specified, a port will be selected at random.
     #[clap(long, default_value_t = 0)]
     metrics_server_port: u16,
 }
@@ -159,7 +169,8 @@ fn main() -> Result<()> {
     let node_socket_addr = SocketAddr::new(opt.ip, opt.port);
     let (root_dir, keypair) = get_root_dir_and_keypair(&opt.root_dir)?;
 
-    let (log_output_dest, _log_appender_guard) = init_logging(&opt, keypair.public().to_peer_id())?;
+    let (log_output_dest, log_reload_handle, _log_appender_guard) =
+        init_logging(&opt, keypair.public().to_peer_id())?;
 
     let rt = Runtime::new()?;
     let bootstrap_peers = rt.block_on(get_peers_from_args(opt.peers))?;
@@ -169,7 +180,10 @@ fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
     info!("\n{}\n{}", msg, "=".repeat(msg.len()));
-    debug!("Built with git version: {}", sn_build_info::git_info());
+    debug!(
+        "safenode built with git version: {}",
+        sn_build_info::git_info()
+    );
 
     info!("Node started with initial_peers {bootstrap_peers:?}");
 
@@ -179,18 +193,21 @@ fn main() -> Result<()> {
     #[cfg(feature = "metrics")]
     rt.spawn(init_metrics(std::process::id()));
     let restart_options = rt.block_on(async move {
-        let node_builder = NodeBuilder::new(
+        let mut node_builder = NodeBuilder::new(
             keypair,
             node_socket_addr,
             bootstrap_peers,
             opt.local,
             root_dir,
+            opt.owner.clone(),
         );
+        node_builder.is_behind_home_network = opt.home_network;
         #[cfg(feature = "open-metrics")]
         let mut node_builder = node_builder;
         #[cfg(feature = "open-metrics")]
         node_builder.metrics_server_port(opt.metrics_server_port);
-        let restart_options = run_node(node_builder, opt.rpc, &log_output_dest).await?;
+        let restart_options =
+            run_node(node_builder, opt.rpc, &log_output_dest, log_reload_handle).await?;
 
         Ok::<_, eyre::Report>(restart_options)
     })?;
@@ -214,6 +231,7 @@ async fn run_node(
     node_builder: NodeBuilder,
     rpc: Option<SocketAddr>,
     log_output_dest: &str,
+    log_reload_handle: ReloadHandle,
 ) -> Result<Option<(PathBuf, u16)>> {
     let started_instant = std::time::Instant::now();
 
@@ -270,6 +288,7 @@ You can check your reward balance by running:
             running_node.clone(),
             ctrl_tx,
             started_instant,
+            log_reload_handle,
         );
     }
 
@@ -333,11 +352,11 @@ fn monitor_node_events(mut node_events_rx: NodeEventsReceiver, ctrl_tx: mpsc::Se
                         break;
                     }
                 }
-                Ok(NodeEvent::TerminateNode) => {
+                Ok(NodeEvent::TerminateNode(reason)) => {
                     if let Err(err) = ctrl_tx
                         .send(NodeCtrl::Stop {
                             delay: Duration::from_secs(1),
-                            cause: eyre!("Node terminated due to termination command !"),
+                            cause: eyre!("Node terminated due to: {reason:?}"),
                         })
                         .await
                     {
@@ -360,7 +379,7 @@ fn monitor_node_events(mut node_events_rx: NodeEventsReceiver, ctrl_tx: mpsc::Se
     });
 }
 
-fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, Option<WorkerGuard>)> {
+fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, ReloadHandle, Option<WorkerGuard>)> {
     let logging_targets = vec![
         ("sn_networking".to_string(), Level::INFO),
         ("safenode".to_string(), Level::DEBUG),
@@ -383,7 +402,7 @@ fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, Option<WorkerGuar
     };
 
     #[cfg(not(feature = "otlp"))]
-    let log_appender_guard = {
+    let (reload_handle, log_appender_guard) = {
         let mut log_builder = sn_logging::LogBuilder::new(logging_targets);
         log_builder.output_dest(output_dest.clone());
         log_builder.format(opt.log_format.unwrap_or(LogFormat::Default));
@@ -398,10 +417,10 @@ fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, Option<WorkerGuar
     };
 
     #[cfg(feature = "otlp")]
-    let (_rt, log_appender_guard) = {
+    let (_rt, reload_handle, log_appender_guard) = {
         // init logging in a separate runtime if we are sending traces to an opentelemetry server
         let rt = Runtime::new()?;
-        let guard = rt.block_on(async {
+        let (reload_handle, log_appender_guard) = rt.block_on(async {
             let mut log_builder = sn_logging::LogBuilder::new(logging_targets);
             log_builder.output_dest(output_dest.clone());
             log_builder.format(opt.log_format.unwrap_or(LogFormat::Default));
@@ -413,9 +432,10 @@ fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, Option<WorkerGuar
             }
             log_builder.initialize()
         })?;
-        (rt, guard)
+        (rt, reload_handle, log_appender_guard)
     };
-    Ok((output_dest.to_string(), log_appender_guard))
+
+    Ok((output_dest.to_string(), reload_handle, log_appender_guard))
 }
 
 fn create_secret_key_file(path: impl AsRef<Path>) -> Result<std::fs::File, std::io::Error> {

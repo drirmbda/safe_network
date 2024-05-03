@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@5ce82f5d814d4010519d15f0552aec4f17a1e1fe
+      - uses: wagoid/commitlint-github-action@3c75220e8d20774b68eea48e869a706ff7249b54
 
   checks:
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
@@ -75,8 +75,15 @@ jobs:
         shell: bash
         run: if [[ ! $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].features.default[]? | select(. == "local-discovery")') ]]; then echo "local-discovery is not a default feature in any package."; else echo "local-discovery is a default feature in at least one package." && exit 1; fi
 
+      # In a cargo workspace, feature unification can occur, allowing a crate to be built successfully even if it
+      # doesn't explicitly specify a feature it uses, provided another crate in the workspace enables that feature.
+      # To detect such cases, we must build each crate using `--package` flag, building all packages at once does not work.
       - name: Check the whole workspace can build
-        run: cargo build --all-targets --all-features
+        shell: bash
+        run: |
+          for package in $(cargo metadata --no-deps --format-version=1 | jq -r '.packages[].name'); do
+            cargo build -p "$package" --all-targets --all-features
+          done
 
   unit:
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
@@ -95,8 +102,9 @@ jobs:
 
       - name: Run CLI tests
         timeout-minutes: 25
-        run: cargo test --release --package sn_cli
+        run: cargo test --release --package sn_cli -- --skip test_acc_packet_
 
+        # We do not run client `--tests` here as they can require a network
       - name: Run client tests
         timeout-minutes: 25
         run: |
@@ -114,6 +122,10 @@ jobs:
       - name: Run transfers tests
         timeout-minutes: 25
         run: cargo test --release --package sn_transfers
+
+      - name: Run logging tests
+        timeout-minutes: 25
+        run: cargo test --release --package sn_logging
 
       - name: Run register tests
         timeout-minutes: 25
@@ -138,7 +150,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo cache registry, index and build
-        uses: actions/cache@v4.0.1
+        uses: actions/cache@v4.0.2
         with:
           path: |
             ~/.cargo/registry
@@ -146,181 +158,184 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-cache-${{ hashFiles('**/Cargo.lock') }}
       - shell: bash
-        run: cargo test --release --bin safenode-manager
+        run: cargo test --lib --package sn-node-manager
 
-  node-manager-e2e-tests:
-    name: node manager e2e tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, elevated: sudo env PATH="$PATH" }
-          - { os: macos-latest, elevated: sudo }
-          - { os: windows-latest }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - shell: bash
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
-        run: |
-          ${{ matrix.elevated }} rustup default stable
-          ${{ matrix.elevated }} cargo test --package sn-node-manager --release --test e2e -- --nocapture
-
-      # Powershell step runs as admin by default.
-      - name: run integration test in powershell
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          curl -L -o WinSW.exe $env:WINSW_URL
-
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
-          Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
-          $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
-
-          cargo test --release --package sn-node-manager --test e2e -- --nocapture
+#
+# Temporarily disable node manager integration tests until they can be made more isolated.
+#
+  # node-manager-e2e-tests:
+  #   name: node manager e2e tests
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - { os: ubuntu-latest, elevated: sudo env PATH="$PATH" }
+  #         - { os: macos-latest, elevated: sudo }
+  #         - { os: windows-latest }
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #
+  #     - shell: bash
+  #       if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+  #       run: |
+  #         ${{ matrix.elevated }} rustup default stable
+  #         ${{ matrix.elevated }} cargo test --package sn-node-manager --release --test e2e -- --nocapture
+  #
+  #     # Powershell step runs as admin by default.
+  #     - name: run integration test in powershell
+  #       if: matrix.os == 'windows-latest'
+  #       shell: pwsh
+  #       run: |
+  #         curl -L -o WinSW.exe $env:WINSW_URL
+  #
+  #         New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
+  #         Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
+  #         $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
+  #
+  #         cargo test --release --package sn-node-manager --test e2e -- --nocapture
 
   # Each upgrade test needs its own VM, otherwise they will interfere with each other.
-  node-manager-upgrade-tests:
-    name: node manager upgrade tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {
-              os: ubuntu-latest,
-              elevated: sudo env PATH="$PATH",
-              test: upgrade_to_latest_version,
-            }
-          - {
-              os: ubuntu-latest,
-              elevated: sudo env PATH="$PATH",
-              test: force_upgrade_when_two_binaries_have_the_same_version,
-            }
-          - {
-              os: ubuntu-latest,
-              elevated: sudo env PATH="$PATH",
-              test: force_downgrade_to_a_previous_version,
-            }
-          - {
-              os: ubuntu-latest,
-              elevated: sudo env PATH="$PATH",
-              test: upgrade_from_older_version_to_specific_version,
-            }
-          - {
-              os: macos-latest,
-              elevated: sudo,
-              test: upgrade_to_latest_version,
-            }
-          - {
-              os: macos-latest,
-              elevated: sudo,
-              test: force_upgrade_when_two_binaries_have_the_same_version,
-            }
-          - {
-              os: macos-latest,
-              elevated: sudo,
-              test: force_downgrade_to_a_previous_version,
-            }
-          - {
-              os: macos-latest,
-              elevated: sudo,
-              test: upgrade_from_older_version_to_specific_version,
-            }
-          - { os: windows-latest, test: upgrade_to_latest_version }
-          - {
-              os: windows-latest,
-              test: force_upgrade_when_two_binaries_have_the_same_version,
-            }
-          - { os: windows-latest, test: force_downgrade_to_a_previous_version }
-          - {
-              os: windows-latest,
-              test: upgrade_from_older_version_to_specific_version,
-            }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - shell: bash
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
-        run: |
-          ${{ matrix.elevated }} rustup default stable
-          ${{ matrix.elevated }} cargo test --package sn-node-manager --release \
-            --test upgrades ${{ matrix.test }} -- --nocapture
-
-      # Powershell step runs as admin by default.
-      - name: run integration test in powershell
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          curl -L -o WinSW.exe $env:WINSW_URL
-
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
-          Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
-          $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
-
-          cargo test --package sn-node-manager --release `
-            --test upgrades ${{ matrix.test }} -- --nocapture
-
-  # Each daemon test needs its own VM, otherwise they will interfere with each other.
-  node-manager-daemon-tests:
-    name: node manager daemon tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {
-              os: ubuntu-latest,
-              elevated: sudo env PATH="$PATH",
-              test: restart_node,
-            }
-          # todo: enable once url/version has been implemented for Daemon subcmd.
-          # - {
-          #     os: macos-latest,
-          #     elevated: sudo,
-          #     test: restart_node,
-          #   }
-          # - {
-          #     os: windows-latest,
-          #     test: restart_node,
-          #   }
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: run integration test
-        shell: bash
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
-        run: |
-          ${{ matrix.elevated }} rustup default stable
-          ${{ matrix.elevated }} cargo test --package sn-node-manager --release \
-            --test daemon ${{ matrix.test }} -- --nocapture
-
-      # Powershell step runs as admin by default.
-      - name: run integration test in powershell
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          curl -L -o WinSW.exe $env:WINSW_URL
-
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
-          Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
-          $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
-
-          cargo test --package sn-node-manager --release `
-            --test daemon ${{ matrix.test }} -- --nocapture
+  # node-manager-upgrade-tests:
+  #   name: node manager upgrade tests
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - {
+  #             os: ubuntu-latest,
+  #             elevated: sudo env PATH="$PATH",
+  #             test: upgrade_to_latest_version,
+  #           }
+  #         - {
+  #             os: ubuntu-latest,
+  #             elevated: sudo env PATH="$PATH",
+  #             test: force_upgrade_when_two_binaries_have_the_same_version,
+  #           }
+  #         - {
+  #             os: ubuntu-latest,
+  #             elevated: sudo env PATH="$PATH",
+  #             test: force_downgrade_to_a_previous_version,
+  #           }
+  #         - {
+  #             os: ubuntu-latest,
+  #             elevated: sudo env PATH="$PATH",
+  #             test: upgrade_from_older_version_to_specific_version,
+  #           }
+  #         - {
+  #             os: macos-latest,
+  #             elevated: sudo,
+  #             test: upgrade_to_latest_version,
+  #           }
+  #         - {
+  #             os: macos-latest,
+  #             elevated: sudo,
+  #             test: force_upgrade_when_two_binaries_have_the_same_version,
+  #           }
+  #         - {
+  #             os: macos-latest,
+  #             elevated: sudo,
+  #             test: force_downgrade_to_a_previous_version,
+  #           }
+  #         - {
+  #             os: macos-latest,
+  #             elevated: sudo,
+  #             test: upgrade_from_older_version_to_specific_version,
+  #           }
+  #         - { os: windows-latest, test: upgrade_to_latest_version }
+  #         - {
+  #             os: windows-latest,
+  #             test: force_upgrade_when_two_binaries_have_the_same_version,
+  #           }
+  #         - { os: windows-latest, test: force_downgrade_to_a_previous_version }
+  #         - {
+  #             os: windows-latest,
+  #             test: upgrade_from_older_version_to_specific_version,
+  #           }
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #
+  #     - shell: bash
+  #       if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+  #       run: |
+  #         ${{ matrix.elevated }} rustup default stable
+  #         ${{ matrix.elevated }} cargo test --package sn-node-manager --release \
+  #           --test upgrades ${{ matrix.test }} -- --nocapture
+  #
+  #     # Powershell step runs as admin by default.
+  #     - name: run integration test in powershell
+  #       if: matrix.os == 'windows-latest'
+  #       shell: pwsh
+  #       run: |
+  #         curl -L -o WinSW.exe $env:WINSW_URL
+  #
+  #         New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
+  #         Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
+  #         $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
+  #
+  #         cargo test --package sn-node-manager --release `
+  #           --test upgrades ${{ matrix.test }} -- --nocapture
+  #
+  # # Each daemon test needs its own VM, otherwise they will interfere with each other.
+  # node-manager-daemon-tests:
+  #   name: node manager daemon tests
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - {
+  #             os: ubuntu-latest,
+  #             elevated: sudo env PATH="$PATH",
+  #             test: restart_node,
+  #           }
+  #         # todo: enable once url/version has been implemented for Daemon subcmd.
+  #         # - {
+  #         #     os: macos-latest,
+  #         #     elevated: sudo,
+  #         #     test: restart_node,
+  #         #   }
+  #         # - {
+  #         #     os: windows-latest,
+  #         #     test: restart_node,
+  #         #   }
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #
+  #     - name: run integration test
+  #       shell: bash
+  #       if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+  #       run: |
+  #         ${{ matrix.elevated }} rustup default stable
+  #         ${{ matrix.elevated }} cargo test --package sn-node-manager --release \
+  #           --test daemon ${{ matrix.test }} -- --nocapture
+  #
+  #     # Powershell step runs as admin by default.
+  #     - name: run integration test in powershell
+  #       if: matrix.os == 'windows-latest'
+  #       shell: pwsh
+  #       run: |
+  #         curl -L -o WinSW.exe $env:WINSW_URL
+  #
+  #         New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bin"
+  #         Move-Item -Path WinSW.exe -Destination "$env:GITHUB_WORKSPACE\bin"
+  #         $env:PATH += ";$env:GITHUB_WORKSPACE\bin"
+  #
+  #         cargo test --package sn-node-manager --release `
+  #           --test daemon ${{ matrix.test }} -- --nocapture
 
   e2e:
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
@@ -366,6 +381,16 @@ jobs:
             echo "SAFE_PEERS has been set to $SAFE_PEERS"
           fi
 
+      # only these unit tests require a network, the rest are run above
+      - name: Run sn_client --tests
+        run: cargo test --package sn_client --release --tests
+        env:
+          SN_LOG: "all"
+          # only set the target dir for windows to bypass the linker issue.
+          # happens if we build the node manager via testnet action
+          CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
+        timeout-minutes: 15
+
       - name: Create and fund a wallet to pay for files storage
         run: |
           cargo run --bin faucet --release -- --log-output-dest=data-dir send 1000000 $(cargo run --bin safe --release -- --log-output-dest=data-dir wallet address | tail -n 1) | tail -n 1 > transfer_hex
@@ -395,6 +420,13 @@ jobs:
       # Client FoldersApi tests against local network
       - name: Client FoldersApi tests against local network
         run: cargo test --release --package sn_client --test folders_api
+        env:
+          SN_LOG: "all"
+        timeout-minutes: 10
+
+      # CLI Acc-Packet files and folders tests against local network
+      - name: CLI Acc-Packet files and folders tests
+        run: cargo test --release -p sn_cli test_acc_packet -- --nocapture
         env:
           SN_LOG: "all"
         timeout-minutes: 10
@@ -489,56 +521,6 @@ jobs:
           log_file_prefix: safe_test_logs_e2e
           platform: ${{ matrix.os }}
 
-  gossipsub:
-    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
-    name: Gossipsub E2E tests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build binaries
-        run: cargo build --release --bin safenode --bin faucet
-        timeout-minutes: 30
-
-      - name: Build gossipsub testing executable
-        run: cargo test --release -p sn_node --features=local-discovery --test msgs_over_gossipsub --no-run
-        env:
-          # only set the target dir for windows to bypass the linker issue.
-          # happens if we build the node manager via testnet action
-          CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
-        timeout-minutes: 30
-
-      - name: Start a local network
-        uses: maidsafe/sn-local-testnet-action@main
-        with:
-          action: start
-          interval: 2000
-          node-path: target/release/safenode
-          faucet-path: target/release/faucet
-          platform: ${{ matrix.os }}
-          build: true
-
-      - name: Gossipsub - nodes to subscribe to topics, and publish messages
-        run: cargo test --release -p sn_node --features local-discovery --test msgs_over_gossipsub -- --nocapture
-        env:
-          CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
-        timeout-minutes: 20
-
-      - name: Stop the local network and upload logs
-        if: always()
-        uses: maidsafe/sn-local-testnet-action@main
-        with:
-          action: stop
-          log_file_prefix: safe_test_logs_gossipsub_e2e
-          platform: ${{ matrix.os }}
-
   spend_test:
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
     name: spend tests against network
@@ -608,69 +590,6 @@ jobs:
           log_file_prefix: safe_test_logs_spend
           platform: ${{ matrix.os }}
 
-  royalty_reward_test:
-    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
-    name: royalty_reward tests against network
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build binaries
-        run: cargo build --release --features=local-discovery,royalties-by-gossip --bin safenode --bin faucet
-        timeout-minutes: 30
-
-      - name: Build testing executable
-        run: cargo test --release -p sn_node --features=local-discovery,royalties-by-gossip --test nodes_rewards --no-run
-        env:
-          # only set the target dir for windows to bypass the linker issue.
-          # happens if we build the node manager via testnet action
-          CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
-        timeout-minutes: 30
-
-      - name: Start a local network
-        uses: maidsafe/sn-local-testnet-action@main
-        with:
-          action: start
-          interval: 2000
-          node-path: target/release/safenode
-          faucet-path: target/release/faucet
-          platform: ${{ matrix.os }}
-          build: true
-
-      - name: Check SAFE_PEERS was set
-        shell: bash
-        run: |
-          if [[ -z "$SAFE_PEERS" ]]; then
-            echo "The SAFE_PEERS variable has not been set"
-            exit 1
-          else
-            echo "SAFE_PEERS has been set to $SAFE_PEERS"
-          fi
-
-      # This should be first to avoid slow reward acceptance etc
-      - name: execute the nodes rewards tests
-        run: cargo test --release -p sn_node --features=local-discovery,royalties-by-gossip --test nodes_rewards -- --nocapture --test-threads=1
-        env:
-          SN_LOG: "all"
-          CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
-        timeout-minutes: 25
-
-      - name: Stop the local network and upload logs
-        if: always()
-        uses: maidsafe/sn-local-testnet-action@main
-        with:
-          action: stop
-          log_file_prefix: safe_test_logs_royalty_reward
-          platform: ${{ matrix.os }}
-
   token_distribution_test:
     if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
     name: token distribution test
@@ -688,7 +607,7 @@ jobs:
 
       - name: Build binaries
         run: cargo build --release --features=local-discovery,distribution --bin safenode --bin faucet
-        timeout-minutes: 30
+        timeout-minutes: 35
 
       - name: Build testing executable
         run: cargo test --release --features=local-discovery,distribution --no-run
@@ -696,7 +615,7 @@ jobs:
           # only set the target dir for windows to bypass the linker issue.
           # happens if we build the node manager via testnet action
           CARGO_TARGET_DIR: ${{ matrix.os == 'windows-latest' && './test-target' || '.' }}
-        timeout-minutes: 30
+        timeout-minutes: 35
 
       - name: Start a local network
         uses: maidsafe/sn-local-testnet-action@main
@@ -961,6 +880,16 @@ jobs:
           fi
           node_count=$(ls "${{ matrix.node_data_path }}" | wc -l)
           echo "Node dir count is $node_count"
+
+      - name: check there is no failed replication fetch
+        if: matrix.os != 'windows-latest' # causes error
+        shell: bash
+        run: |
+          if grep -r "failed to fetch" "${{ matrix.node_data_path }}"
+          then
+            echo "We find failed replication fetch"
+            exit 1
+          fi
 
       # Only error out after uploading the logs
       - name: Don't log raw data

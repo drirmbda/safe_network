@@ -11,11 +11,14 @@ use super::{
     Transaction, UniquePubkey,
 };
 
-use crate::{Error, Result};
+use crate::{Result, TransferError};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use tiny_keccak::{Hasher, Sha3};
+
+/// OutputDetails: (CashNoteReason, pub_key, derived_key)
+pub type CashNoteOutputDetails = (String, MainPubkey, DerivationIndex);
 
 /// Represents a CashNote (CashNote).
 ///
@@ -58,25 +61,29 @@ use tiny_keccak::{Hasher, Sha3};
 /// eg: `cashnote.derivation_index(&main_key)`
 #[derive(custom_debug::Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct CashNote {
-    /// The unique pulbic key of this CashNote. It is unique, and there can never
-    /// be another CashNote with the same pulbic key. It used in SignedSpends.
-    pub id: UniquePubkey,
+    /// The unique public key of this CashNote. It is unique, and there can never
+    /// be another CashNote with the same public key. It used in SignedSpends.
+    pub unique_pubkey: UniquePubkey,
     /// The transaction where this CashNote was created.
     #[debug(skip)]
-    pub src_tx: Transaction,
+    pub parent_tx: Transaction,
     /// The transaction's input's SignedSpends
-    pub signed_spends: BTreeSet<SignedSpend>,
-    /// This is the MainPubkey of the recipient of this CashNote.
+    pub parent_spends: BTreeSet<SignedSpend>,
+    /// The purpose this cash_note created for
+    /// eg. `store cost pay to...`, `network royalty`, `change to self`, `payment transfer`, ...
+    pub purpose: String,
+    /// This is the MainPubkey of the owner of this CashNote
     pub main_pubkey: MainPubkey,
-    /// This indicates which index to use when deriving the UniquePubkey of the
-    /// CashNote, from the MainPubkey.
+    /// The derivation index used to derive the UniquePubkey and DerivedSecretKey from the MainPubkey and MainSecretKey respectively.
+    /// It is to be kept secret to preserve the privacy of the owner.
+    /// Without it, it is very hard to link the MainPubkey (original owner) and the UniquePubkey (derived unique identity of the CashNote)
     pub derivation_index: DerivationIndex,
 }
 
 impl CashNote {
-    /// Return the id of this CashNote.
+    /// Return the unique pubkey of this CashNote.
     pub fn unique_pubkey(&self) -> UniquePubkey {
-        self.id
+        self.unique_pubkey
     }
 
     // Return MainPubkey from which UniquePubkey is derived.
@@ -89,7 +96,7 @@ impl CashNote {
     /// CashNote MainPubkey.
     pub fn derived_key(&self, main_key: &MainSecretKey) -> Result<DerivedSecretKey> {
         if &main_key.main_pubkey() != self.main_pubkey() {
-            return Err(Error::MainSecretKeyDoesNotMatchMainPubkey);
+            return Err(TransferError::MainSecretKeyDoesNotMatchMainPubkey);
         }
         Ok(main_key.derive_key(&self.derivation_index()))
     }
@@ -99,7 +106,7 @@ impl CashNote {
     /// CashNote MainPubkey.
     pub fn derived_pubkey(&self, main_pubkey: &MainPubkey) -> Result<UniquePubkey> {
         if main_pubkey != self.main_pubkey() {
-            return Err(Error::MainPubkeyMismatch);
+            return Err(TransferError::MainPubkeyMismatch);
         }
         Ok(main_pubkey.new_unique_pubkey(&self.derivation_index()))
     }
@@ -111,37 +118,44 @@ impl CashNote {
 
     /// Return the reason why this CashNote was spent.
     /// Will be the default Hash (empty) if reason is none.
-    pub fn reason(&self) -> Hash {
-        self.signed_spends
+    pub fn spent_reason(&self) -> Hash {
+        self.parent_spends
             .iter()
             .next()
-            .map(|c| c.reason())
+            .map(|s| s.reason())
             .unwrap_or_default()
+    }
+
+    /// Return the purpose why this CashNote was created.
+    pub fn purpose(&self) -> String {
+        self.purpose.clone()
     }
 
     /// Return the value in NanoTokens for this CashNote.
     pub fn value(&self) -> Result<NanoTokens> {
         Ok(self
-            .src_tx
+            .parent_tx
             .outputs
             .iter()
             .find(|o| &self.unique_pubkey() == o.unique_pubkey())
-            .ok_or(Error::OutputNotFound)?
+            .ok_or(TransferError::OutputNotFound)?
             .amount)
     }
 
     /// Generate the hash of this CashNote
     pub fn hash(&self) -> Hash {
         let mut sha3 = Sha3::v256();
-        sha3.update(self.src_tx.hash().as_ref());
+        sha3.update(self.parent_tx.hash().as_ref());
         sha3.update(&self.main_pubkey.to_bytes());
         sha3.update(&self.derivation_index.0);
 
-        for sp in self.signed_spends.iter() {
+        for sp in self.parent_spends.iter() {
             sha3.update(&sp.to_bytes());
         }
 
-        sha3.update(self.reason().as_ref());
+        sha3.update(&self.purpose.clone().into_bytes());
+
+        sha3.update(self.spent_reason().as_ref());
         let mut hash = [0u8; 32];
         sha3.finalize(&mut hash);
         Hash::from(hash)
@@ -160,43 +174,43 @@ impl CashNote {
     ///
     /// see TransactionVerifier::verify() for a description of
     /// verifier requirements.
-    pub fn verify(&self, main_key: &MainSecretKey) -> Result<(), Error> {
-        self.src_tx
-            .verify_against_inputs_spent(&self.signed_spends)?;
+    pub fn verify(&self, main_key: &MainSecretKey) -> Result<(), TransferError> {
+        self.parent_tx
+            .verify_against_inputs_spent(self.parent_spends.iter())?;
 
         let unique_pubkey = self.derived_key(main_key)?.unique_pubkey();
         if !self
-            .src_tx
+            .parent_tx
             .outputs
             .iter()
             .any(|o| unique_pubkey.eq(o.unique_pubkey()))
         {
-            return Err(Error::CashNoteCiphersNotPresentInTransactionOutput);
+            return Err(TransferError::CashNoteCiphersNotPresentInTransactionOutput);
         }
 
         // verify that all signed_spend reasons are equal
-        let reason = self.reason();
-        let reasons_are_equal = |s: &SignedSpend| reason == s.reason();
-        if !self.signed_spends.iter().all(reasons_are_equal) {
-            return Err(Error::SignedSpendReasonMismatch(unique_pubkey));
+        let spent_reason = self.spent_reason();
+        let reasons_are_equal = |s: &SignedSpend| spent_reason == s.reason();
+        if !self.parent_spends.iter().all(reasons_are_equal) {
+            return Err(TransferError::SignedSpendReasonMismatch(unique_pubkey));
         }
         Ok(())
     }
 
     /// Deserializes a `CashNote` represented as a hex string to a `CashNote`.
-    pub fn from_hex(hex: &str) -> Result<Self, Error> {
+    pub fn from_hex(hex: &str) -> Result<Self, TransferError> {
         let mut bytes =
-            hex::decode(hex).map_err(|e| Error::HexDeserializationFailed(e.to_string()))?;
+            hex::decode(hex).map_err(|e| TransferError::HexDeserializationFailed(e.to_string()))?;
         bytes.reverse();
         let cashnote: CashNote = rmp_serde::from_slice(&bytes)
-            .map_err(|e| Error::HexDeserializationFailed(e.to_string()))?;
+            .map_err(|e| TransferError::HexDeserializationFailed(e.to_string()))?;
         Ok(cashnote)
     }
 
     /// Serialize this `CashNote` instance to a hex string.
-    pub fn to_hex(&self) -> Result<String, Error> {
-        let mut serialized =
-            rmp_serde::to_vec(&self).map_err(|e| Error::HexSerializationFailed(e.to_string()))?;
+    pub fn to_hex(&self) -> Result<String, TransferError> {
+        let mut serialized = rmp_serde::to_vec(&self)
+            .map_err(|e| TransferError::HexSerializationFailed(e.to_string()))?;
         serialized.reverse();
         Ok(hex::encode(serialized))
     }

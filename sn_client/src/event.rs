@@ -6,7 +6,6 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -30,9 +29,10 @@ impl ClientEventsBroadcaster {
     // Broadcast a new event, meant to be a helper only used by the client's internals.
     pub(crate) fn broadcast(&self, event: ClientEvent) {
         if let Err(err) = self.0.send(event) {
-            trace!(
-                "Could not broadcast ClientEvent as we don't have any active listeners: {err:?}"
-            );
+            if self.0.receiver_count() == 0 {
+                return;
+            }
+            trace!("Could not broadcast ClientEvent, though we do have listeners: {err:?}");
         }
     }
 }
@@ -43,19 +43,16 @@ pub enum ClientEvent {
     /// A peer has been added to the Routing table.
     /// Also contains the max number of peers to connect to before we receive ClientEvent::ConnectedToNetwork
     PeerAdded { max_peers_to_connect: usize },
+    /// We've encountered a Peer with an unsupported protocol.
+    PeerWithUnsupportedProtocol {
+        our_protocol: String,
+        their_protocol: String,
+    },
     /// The client has been connected to the network
     ConnectedToNetwork,
     /// No network activity has been received for a given duration
     /// we should error out
     InactiveClient(tokio::time::Duration),
-    /// Gossipsub message received on a topic the client has subscribed to
-    GossipsubMsg {
-        /// Topic the message was published on
-        topic: String,
-        /// The raw bytes of the received message
-        #[debug(skip)]
-        msg: Bytes,
-    },
 }
 
 /// Receiver Channel where users of the public API can listen to events broadcasted by the client.

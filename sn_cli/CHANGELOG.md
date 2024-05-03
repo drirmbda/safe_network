@@ -6,6 +6,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.90.2](https://github.com/maidsafe/safe_network/compare/sn_cli-v0.90.1...sn_cli-v0.90.2) - 2024-03-28
+
+### Fixed
+- *(cli)* read from cache during initial chunking process
+- *(uploader)* do not error out on quote expiry during get store cost
+
+## [0.90.1](https://github.com/joshuef/safe_network/compare/sn_cli-v0.90.0...sn_cli-v0.90.1) - 2024-03-28
+
+### Added
+- *(uploader)* error out if the quote has expired during get store_cost
+- *(uploader)* use WalletApi to prevent loading client wallet during each operation
+- *(transfers)* implement WalletApi to expose common methods
+
+### Fixed
+- *(uploader)* clarify the use of root and wallet dirs
+
+### Other
+- *(uploader)* update docs
+
+## [0.90.0](https://github.com/joshuef/safe_network/compare/sn_cli-v0.89.85...sn_cli-v0.90.0) - 2024-03-27
+
+### Added
+- *(cli)* expose AccountPacket APIs from a lib so it can be used by other apps
+- *(uploader)* collect all the uploaded registers
+- *(uploader)* allow either chunk or chunk path to be used
+- *(uploader)* register existence should be checked before going with payment flow
+- *(client)* use the new Uploader insetead of FilesUpload
+- make logging simpler to use
+- [**breaking**] remove gossip code
+- svg caching, fault tolerance during DAG collection
+- *(uploader)* repay immediately if the quote has expired
+- *(uploader)* use ClientRegister instead of Registers
+- *(client)* implement a generic uploader with repay ability
+- *(transfers)* enable client to check if a quote has expired
+- *(client)* make publish register as an associated function
+- *(network)* filter out peers when returning store cost
+- *(transfers)* [**breaking**] support multiple payments for the same xorname
+- use Arc inside Client, Network to reduce clone cost
+- *(networking)* add NodeIssue for tracking bad node shunning
+- *(faucet)* rate limit based upon wallet locks
+
+### Fixed
+- *(cli)* files should be chunked before checking if the chunks are empty
+- *(test)* use tempfile lib instead of stdlib to create temp dirs
+- *(clippy)* allow too many arguments as it is a private function
+- *(uploader)* remove unused error tracking and allow retries for new payee
+- *(uploader)* make the internals more clean
+- *(uploader)* update force make payment logic
+- *(register)* permissions verification was not being made by some Register APIs
+- *(node)* fetching new data shall not cause timed_out immediately
+- *(test)* generate unique temp dir to avoid read outdated data
+- *(register)* shortcut permissions check when anyone can write to Register
+
+### Other
+- *(cli)* moving binary target related files onto src/bin dir
+- *(uploader)* remove FilesApi dependency
+- *(uploader)* implement UploaderInterface for easier testing
+- rename of function to be more descriptive
+- remove counter run through several functions and replace with simple counter
+- *(register)* minor simplification in Register Permissions implementation
+- *(uploader)* remove unused code path when store cost is 0
+- *(uploader)* implement tests to test the basic pipeline logic
+- *(uploader)* initial test setup for uploader
+- *(uploader)* remove failed_to states
+- *(node)* refactor pricing metrics
+- lower some networking log levels
+- *(node)* loose bad node detection criteria
+- *(node)* optimization to reduce logging
+
+## [0.89.85](https://github.com/joshuef/safe_network/compare/sn_cli-v0.89.84...sn_cli-v0.89.85) - 2024-03-21
+
+### Added
+- *(cli)* have CLI folders cmds to act on current directory by default
+- *(folders)* folders APIs to accept an encryption key for metadata chunks
+- *(log)* set log levels on the fly
+- improve parallelisation with buffered streams
+- refactor DAG, improve error management and security
+- dag error recording
+- *(protocol)* add rpc to set node log level on the fly
+
+### Other
+- *(cli)* adding automated test for metadata chunk encryption
+- *(cli)* adding some high-level doc to acc-packet codebase
+- *(node)* reduce bad_nodes check resource usage
+
+## [0.89.84](https://github.com/joshuef/safe_network/compare/sn_cli-v0.89.83...sn_cli-v0.89.84) - 2024-03-18
+
+### Other
+- *(acc-packet)* adding test for acc-packet moved to a different location on disk
+- *(acc-packet)* adding unit test for acc-packet changes scanning logic
+- *(acc-packet)* adding unit test to private methods/helpers
+- *(cli)* breaking up acc-packet logic within its own mod
+- name change to spawn events handler
+- increase of text length
+- iterate upload code rearranged for clear readability
+
+## [0.89.83](https://github.com/joshuef/safe_network/compare/sn_cli-v0.89.82...sn_cli-v0.89.83) - 2024-03-14
+
+### Added
+- self in import change
+- moved param to outside calc
+- refactor spend validation
+
+### Fixed
+- *(cli)* allow to upload chunks from acc-packet using chunked files local cache
+- *(cli)* use chunk-mgr with iterator skipping tracking info files
+
+### Other
+- *(acc-packet)* adding verifications to compare tracking info generated on acc-packets cloned
+- *(acc-packet)* adding verifications to compare the files/dirs stored on acc-packets cloned
+- *(acc-packet)* testing sync empty root dirs
+- *(acc-packet)* testing mutations syncing across clones of an acc-packet
+- *(acc-packet)* adding automated tests to sn_cli::AccountPacket
+- *(cli)* chunk-mgr to report files chunked/uploaded rather than bailing out
+- improve code quality
+- new `sn_service_management` crate
+
 ## [0.89.82-alpha.1](https://github.com/joshuef/safe_network/compare/sn_cli-v0.89.82-alpha.0...sn_cli-v0.89.82-alpha.1) - 2024-03-08
 
 ### Added

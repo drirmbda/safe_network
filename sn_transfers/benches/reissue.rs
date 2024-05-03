@@ -26,6 +26,7 @@ fn bench_reissue_1_to_100(c: &mut Criterion) {
             let main_key = MainSecretKey::random_from_rng(&mut rng);
             (
                 NanoTokens::from(1),
+                Default::default(),
                 main_key.main_pubkey(),
                 DerivationIndex::random(&mut rng),
             )
@@ -81,6 +82,7 @@ fn bench_reissue_100_to_1(c: &mut Criterion) {
         .map(|_| {
             (
                 NanoTokens::from(1),
+                Default::default(),
                 recipient_of_100_mainkey.main_pubkey(),
                 DerivationIndex::random(&mut rng),
             )
@@ -115,12 +117,12 @@ fn bench_reissue_100_to_1(c: &mut Criterion) {
 
     // prepare to send all of those cashnotes back to our starting_main_key
     let total_amount = offline_transfer
-        .created_cash_notes
+        .cash_notes_for_recipient
         .iter()
         .map(|cn| cn.value().unwrap().as_nano())
         .sum();
     let many_cashnotes = offline_transfer
-        .created_cash_notes
+        .cash_notes_for_recipient
         .into_iter()
         .map(|cn| {
             let derivation_index = cn.derivation_index();
@@ -130,6 +132,7 @@ fn bench_reissue_100_to_1(c: &mut Criterion) {
         .collect();
     let one_single_recipient = vec![(
         NanoTokens::from(total_amount),
+        Default::default(),
         starting_main_key.main_pubkey(),
         DerivationIndex::random(&mut rng),
     )];
@@ -143,7 +146,7 @@ fn bench_reissue_100_to_1(c: &mut Criterion) {
     )
     .expect("transfer to succeed");
     let merge_spent_tx = many_to_one_transfer.tx.clone();
-    let signed_spends = many_to_one_transfer
+    let signed_spends: Vec<_> = many_to_one_transfer
         .all_spend_requests
         .into_iter()
         .collect();

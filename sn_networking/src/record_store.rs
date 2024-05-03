@@ -8,12 +8,14 @@
 #![allow(clippy::mutable_key_type)] // for the Bytes in NetworkAddress
 
 use crate::target_arch::{spawn, Instant};
-use crate::{cmd::SwarmCmd, event::NetworkEvent, send_swarm_cmd};
+use crate::CLOSE_GROUP_SIZE;
+use crate::{cmd::SwarmCmd, event::NetworkEvent, log_markers::Marker, send_swarm_cmd};
 use aes_gcm_siv::{
     aead::{Aead, KeyInit, OsRng},
     Aes256GcmSiv, Nonce,
 };
 
+use itertools::Itertools;
 use libp2p::{
     identity::PeerId,
     kad::{
@@ -24,29 +26,37 @@ use libp2p::{
 #[cfg(feature = "open-metrics")]
 use prometheus_client::metrics::gauge::Gauge;
 use rand::RngCore;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use serde::{Deserialize, Serialize};
 use sn_protocol::{
     storage::{RecordHeader, RecordKind, RecordType},
     NetworkAddress, PrettyPrintRecordKey,
 };
-use sn_transfers::NanoTokens;
+use sn_transfers::{NanoTokens, QuotingMetrics, TOTAL_SUPPLY};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    time::SystemTime,
     vec,
 };
 use tokio::sync::mpsc;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 use xor_name::XorName;
 
 /// Max number of records a node can store
 const MAX_RECORDS_COUNT: usize = 2048;
 
+/// File name of the recorded historical quoting metrics.
+const HISTORICAL_QUOTING_METRICS_FILENAME: &str = "historic_quoting_metrics";
+
 /// A `RecordStore` that stores records on disk.
 pub struct NodeRecordStore {
     /// The identity of the peer owning the store.
     local_key: KBucketKey<PeerId>,
+    /// The address of the peer owning the store
+    local_address: NetworkAddress,
     /// The configuration of the store.
     config: NodeRecordStoreConfig,
     /// A set of keys, each corresponding to a data `Record` stored on disk.
@@ -55,9 +65,10 @@ pub struct NodeRecordStore {
     network_event_sender: mpsc::Sender<NetworkEvent>,
     /// Send cmds to the network layer. Used to interact with self in an async fashion.
     swarm_cmd_sender: mpsc::Sender<SwarmCmd>,
-    /// Distance range specify the acceptable range of record entry.
+    /// ilog2 distance range of responsible records
+    /// AKA: how many buckets of data do we consider "close"
     /// None means accept all records.
-    distance_range: Option<Distance>,
+    responsible_distance_range: Option<u32>,
     #[cfg(feature = "open-metrics")]
     /// Used to report the number of records held by the store to the metrics server.
     record_count_metric: Option<Gauge>,
@@ -66,6 +77,10 @@ pub struct NodeRecordStore {
     /// Encyption cipher for the records, randomly generated at node startup
     /// Plus a 4 byte nonce starter
     encryption_details: (Aes256GcmSiv, [u8; 4]),
+    /// Time that this record_store got started
+    timestamp: SystemTime,
+    /// Farthest record to self
+    farthest_record: Option<(Key, Distance)>,
 }
 
 /// Configuration for a `DiskBackedRecordStore`.
@@ -99,74 +114,113 @@ fn generate_nonce_for_record(nonce_starter: &[u8; 4], key: &Key) -> Nonce {
     Nonce::from_iter(nonce_bytes)
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct HistoricQuotingMetrics {
+    received_payment_count: usize,
+    timestamp: SystemTime,
+}
+
 impl NodeRecordStore {
     /// If a directory for our node already exists, repopulate the records from the files in the dir
-    pub fn update_records_from_an_existing_store(
+    fn update_records_from_an_existing_store(
         config: &NodeRecordStoreConfig,
         encryption_details: &(Aes256GcmSiv, [u8; 4]),
     ) -> HashMap<Key, (NetworkAddress, RecordType)> {
-        let mut records = HashMap::default();
-
-        info!("Attempting to repopulate records from existing store...");
-        for entry in WalkDir::new(&config.storage_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        let process_entry = |entry: &DirEntry| -> _ {
             let path = entry.path();
             if path.is_file() {
-                info!("Existing record found: {path:?}");
+                trace!("Existing record found: {path:?}");
                 // if we've got a file, lets try and read it
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    // get the record key from the filename
-                    if let Some(key) = Self::get_data_from_filename(filename) {
-                        let record = match fs::read(path) {
-                            Ok(bytes) => {
-                                // and the stored record
-                                Self::get_record_from_bytes(bytes, &key, encryption_details)
-                            }
-                            Err(err) => {
-                                error!(
-                                    "Error while reading file. filename: {filename}, error: {err:?}"
-                                );
-                                None
-                            }
-                        };
-
-                        if let Some(record) = record {
-                            let record_type = match RecordHeader::is_record_of_type_chunk(&record) {
-                                Ok(true) => RecordType::Chunk,
-                                Ok(false) => {
-                                    let xorname_hash = XorName::from_content(&record.value);
-                                    RecordType::NonChunk(xorname_hash)
-                                }
-                                Err(error) => {
-                                    warn!("Failed to parse record type from record: {:?}", error);
-                                    continue;
-                                }
-                            };
-
-                            let address = NetworkAddress::from_record_key(&key);
-                            records.insert(key, (address, record_type));
-                            info!("Existing record loaded: {path:?}");
-                        }
-                    };
-                } else {
-                    // warn and remove this file as it's not a valid record
-                    warn!(
-                        "Found a file in the storage dir that is not a valid record: {:?}",
-                        path
-                    );
-                    if let Err(e) = fs::remove_file(path) {
+                let filename = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(file_name) => file_name,
+                    None => {
+                        // warn and remove this file as it's not a valid record
                         warn!(
-                            "Failed to remove invalid record file from storage dir: {:?}",
-                            e
+                            "Found a file in the storage dir that is not a valid record: {:?}",
+                            path
                         );
+                        if let Err(e) = fs::remove_file(path) {
+                            warn!(
+                                "Failed to remove invalid record file from storage dir: {:?}",
+                                e
+                            );
+                        }
+                        return None;
                     }
-                }
+                };
+                // get the record key from the filename
+                let key = Self::get_data_from_filename(filename)?;
+                let record = match fs::read(path) {
+                    Ok(bytes) => {
+                        // and the stored record
+                        Self::get_record_from_bytes(bytes, &key, encryption_details)?
+                    }
+                    Err(err) => {
+                        error!("Error while reading file. filename: {filename}, error: {err:?}");
+                        return None;
+                    }
+                };
+
+                let record_type = match RecordHeader::is_record_of_type_chunk(&record) {
+                    Ok(true) => RecordType::Chunk,
+                    Ok(false) => {
+                        let xorname_hash = XorName::from_content(&record.value);
+                        RecordType::NonChunk(xorname_hash)
+                    }
+                    Err(error) => {
+                        warn!("Failed to parse record type from record: {:?}", error);
+                        return None;
+                    }
+                };
+
+                let address = NetworkAddress::from_record_key(&key);
+                info!("Existing record loaded: {path:?}");
+                return Some((key, (address, record_type)));
+            }
+            None
+        };
+
+        info!("Attempting to repopulate records from existing store...");
+        let records = WalkDir::new(&config.storage_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .collect_vec()
+            .par_iter()
+            .filter_map(process_entry)
+            .collect();
+        records
+    }
+
+    /// If quote_metrics file already exists, using the existing parameters.
+    fn restore_quoting_metrics(storage_dir: &Path) -> Option<HistoricQuotingMetrics> {
+        let file_path = storage_dir.join(HISTORICAL_QUOTING_METRICS_FILENAME);
+
+        if let Ok(file) = fs::File::open(file_path) {
+            if let Ok(quoting_metrics) = rmp_serde::from_read(&file) {
+                return Some(quoting_metrics);
             }
         }
 
-        records
+        None
+    }
+
+    fn flush_historic_quoting_metrics(&self) {
+        let file_path = self
+            .config
+            .storage_dir
+            .join(HISTORICAL_QUOTING_METRICS_FILENAME);
+
+        let historic_quoting_metrics = HistoricQuotingMetrics {
+            received_payment_count: self.received_payment_count,
+            timestamp: self.timestamp,
+        };
+
+        spawn(async move {
+            if let Ok(mut file) = fs::File::create(file_path) {
+                let mut serialiser = rmp_serde::encode::Serializer::new(&mut file);
+                let _ = historic_quoting_metrics.serialize(&mut serialiser);
+            }
+        });
     }
 
     /// Creates a new `DiskBackedStore` with the given configuration.
@@ -182,19 +236,42 @@ impl NodeRecordStore {
         OsRng.fill_bytes(&mut nonce_starter);
 
         let encryption_details = (cipher, nonce_starter);
+
+        // Recover the quoting_metrics first, as the historical file will be cleaned by
+        // the later on update_records_from_an_existing_store function
+        let (received_payment_count, timestamp) = if let Some(historic_quoting_metrics) =
+            Self::restore_quoting_metrics(&config.storage_dir)
+        {
+            (
+                historic_quoting_metrics.received_payment_count,
+                historic_quoting_metrics.timestamp,
+            )
+        } else {
+            (0, SystemTime::now())
+        };
+
         let records = Self::update_records_from_an_existing_store(&config, &encryption_details);
-        NodeRecordStore {
+        let mut record_store = NodeRecordStore {
             local_key: KBucketKey::from(local_id),
+            local_address: NetworkAddress::from_peer(local_id),
             config,
             records,
             network_event_sender,
             swarm_cmd_sender,
-            distance_range: None,
+            responsible_distance_range: None,
             #[cfg(feature = "open-metrics")]
             record_count_metric: None,
-            received_payment_count: 0,
+            received_payment_count,
             encryption_details,
-        }
+            timestamp,
+            farthest_record: None,
+        };
+
+        record_store.farthest_record = record_store.calculate_farthest();
+
+        record_store.flush_historic_quoting_metrics();
+
+        record_store
     }
 
     /// Set the record_count_metric to report the number of records stored to the metrics server
@@ -204,9 +281,9 @@ impl NodeRecordStore {
         self
     }
 
-    /// Returns the current distance range
-    pub fn get_distance_range(&self) -> Option<Distance> {
-        self.distance_range
+    /// Returns the current distance ilog2 (aka bucket) range of CLOSE_GROUP nodes.
+    pub fn get_responsible_distance_range(&self) -> Option<u32> {
+        self.responsible_distance_range
     }
 
     // Converts a Key into a Hex string.
@@ -285,37 +362,62 @@ impl NodeRecordStore {
         }
     }
 
+    // Returns the farthest record_key to self.
+    pub fn get_farthest(&self) -> Option<Key> {
+        if let Some((ref key, _distance)) = self.farthest_record {
+            Some(key.clone())
+        } else {
+            None
+        }
+    }
+
+    // Calculates the farthest record_key to self.
+    fn calculate_farthest(&self) -> Option<(Key, Distance)> {
+        // sort records by distance to our local key
+        let mut sorted_records: Vec<_> = self.records.keys().collect();
+        sorted_records.sort_by_key(|key| {
+            let addr = NetworkAddress::from_record_key(key);
+            self.local_address.distance(&addr)
+        });
+
+        if let Some(key) = sorted_records.last() {
+            let addr = NetworkAddress::from_record_key(key);
+            Some(((*key).clone(), self.local_address.distance(&addr)))
+        } else {
+            None
+        }
+    }
+
     /// Prune the records in the store to ensure that we free up space
     /// for the incoming record.
-    fn prune_storage_if_needed_for_record(&mut self) {
-        let num_records = self.records.len();
-
+    /// Returns Ok if the record can be stored because it is closer to the local peer
+    /// or we are not full.
+    ///
+    /// Err MaxRecords if we cannot store as it's farther than the farthest data we have
+    fn prune_records_if_needed(&mut self, incoming_record_key: &Key) -> Result<()> {
         // we're not full, so we don't need to prune
-        if num_records < self.config.max_records {
-            return;
+        if self.records.len() < self.config.max_records {
+            return Ok(());
         }
 
-        // sort records by distance to our local key
-        let mut sorted_records: Vec<_> = self.records.keys().cloned().collect();
-        let self_address = NetworkAddress::from_peer(self.local_key.clone().into_preimage());
-        sorted_records.sort_by(|key_a, key_b| {
-            let a = NetworkAddress::from_record_key(key_a);
-            let b = NetworkAddress::from_record_key(key_b);
-            self_address.distance(&a).cmp(&self_address.distance(&b))
-        });
+        if let Some((farthest_record, farthest_record_distance)) = self.farthest_record.clone() {
+            // if the incoming record is farther than the farthest record, we can't store it
+            if farthest_record_distance
+                < self
+                    .local_address
+                    .distance(&NetworkAddress::from_record_key(incoming_record_key))
+            {
+                return Err(Error::MaxRecords);
+            }
 
-        let distance_range = self_address.distance(&NetworkAddress::from_record_key(
-            &sorted_records[sorted_records.len() - 10],
-        ));
-        self.distance_range = Some(distance_range);
-        // sorting will be costive, hence pruning in a batch of 10
-        (sorted_records.len() - 10..sorted_records.len()).for_each(|i| {
             info!(
-                "Record {i} {:?} will be pruned to free up space for new records",
-                PrettyPrintRecordKey::from(&sorted_records[i])
+                "Record {:?} will be pruned to free up space for new records",
+                PrettyPrintRecordKey::from(&farthest_record)
             );
-            self.remove(&sorted_records[i]);
-        });
+            self.remove(&farthest_record);
+        }
+
+        Ok(())
     }
 }
 
@@ -344,10 +446,19 @@ impl NodeRecordStore {
     /// in the RecordStore records set. After this it should be safe
     /// to return the record as stored.
     pub(crate) fn mark_as_stored(&mut self, key: Key, record_type: RecordType) {
-        let _ = self.records.insert(
-            key.clone(),
-            (NetworkAddress::from_record_key(&key), record_type),
-        );
+        let addr = NetworkAddress::from_record_key(&key);
+        let _ = self
+            .records
+            .insert(key.clone(), (addr.clone(), record_type));
+
+        let key_distance = self.local_address.distance(&addr);
+        if let Some((_farthest_record, farthest_record_distance)) = self.farthest_record.clone() {
+            if key_distance > farthest_record_distance {
+                self.farthest_record = Some((key, key_distance));
+            }
+        } else {
+            self.farthest_record = Some((key, key_distance));
+        }
     }
 
     /// Prepare record bytes for storage
@@ -384,7 +495,7 @@ impl NodeRecordStore {
         let record_key = PrettyPrintRecordKey::from(&r.key).into_owned();
         trace!("PUT a verified Record: {record_key:?}");
 
-        self.prune_storage_if_needed_for_record();
+        self.prune_records_if_needed(&r.key)?;
 
         let filename = Self::generate_filename(&r.key);
         let file_path = self.config.storage_dir.join(&filename);
@@ -423,31 +534,62 @@ impl NodeRecordStore {
 
     /// Calculate the cost to store data for our current store state
     #[allow(clippy::mutable_key_type)]
-    pub(crate) fn store_cost(&self) -> NanoTokens {
-        let stored_records = self.records.len();
-        let cost = calculate_cost_for_records(
-            stored_records,
-            self.received_payment_count,
-            self.config.max_records,
-        );
+    pub(crate) fn store_cost(&self, key: &Key) -> (NanoTokens, QuotingMetrics) {
+        let records_stored = self.records.len();
+        let record_keys_as_hashset: HashSet<&Key> = self.records.keys().collect();
 
+        let live_time = if let Ok(elapsed) = self.timestamp.elapsed() {
+            elapsed.as_secs()
+        } else {
+            0
+        };
+
+        let mut quoting_metrics = QuotingMetrics {
+            close_records_stored: records_stored,
+            max_records: self.config.max_records,
+            received_payment_count: self.received_payment_count,
+            live_time,
+        };
+
+        if let Some(distance_range) = self.responsible_distance_range {
+            let relevant_records =
+                self.get_records_within_distance_range(record_keys_as_hashset, distance_range);
+
+            quoting_metrics.close_records_stored = relevant_records;
+        } else {
+            info!("Basing cost of _total_ records stored.");
+        };
+
+        let cost = if self.contains(key) {
+            0
+        } else {
+            calculate_cost_for_records(&quoting_metrics)
+        };
         // vdash metric (if modified please notify at https://github.com/happybeing/vdash/issues):
-        info!("Cost is now {cost:?} for {stored_records:?} stored of {MAX_RECORDS_COUNT:?} max, {:?} times got paid.",
-            self.received_payment_count);
-        NanoTokens::from(cost)
+        info!("Cost is now {cost:?} for quoting_metrics {quoting_metrics:?}");
+
+        Marker::StoreCost {
+            cost,
+            quoting_metrics: &quoting_metrics,
+        }
+        .log();
+
+        (NanoTokens::from(cost), quoting_metrics)
     }
 
     /// Notify the node received a payment.
     pub(crate) fn payment_received(&mut self) {
         self.received_payment_count = self.received_payment_count.saturating_add(1);
+
+        self.flush_historic_quoting_metrics();
     }
 
     /// Calculate how many records are stored within a distance range
     #[allow(clippy::mutable_key_type)]
     pub fn get_records_within_distance_range(
         &self,
-        records: &HashSet<Key>,
-        distance_range: Distance,
+        records: HashSet<&Key>,
+        distance_range: u32,
     ) -> usize {
         debug!(
             "Total record count is {:?}. Distance is: {distance_range:?}",
@@ -458,18 +600,17 @@ impl NodeRecordStore {
             .iter()
             .filter(|key| {
                 let kbucket_key = KBucketKey::new(key.to_vec());
-                distance_range >= self.local_key.distance(&kbucket_key)
+                distance_range >= self.local_key.distance(&kbucket_key).ilog2().unwrap_or(0)
             })
             .count();
 
-        debug!("Relevant records len is {:?}", relevant_records_len);
+        Marker::CloseRecordsLen(&relevant_records_len).log();
         relevant_records_len
     }
 
     /// Setup the distance range.
-    #[cfg(test)]
-    pub(crate) fn set_distance_range(&mut self, distance_range: Distance) {
-        self.distance_range = Some(distance_range);
+    pub(crate) fn set_responsible_distance_range(&mut self, farthest_responsible_bucket: u32) {
+        self.responsible_distance_range = Some(farthest_responsible_bucket);
     }
 }
 
@@ -483,7 +624,7 @@ impl RecordStore for NodeRecordStore {
         // ignored if we don't have the record locally.
         let key = PrettyPrintRecordKey::from(k);
         if !self.records.contains_key(k) {
-            trace!("Record not found locally: {key}");
+            trace!("Record not found locally: {key:?}");
             return None;
         }
 
@@ -559,6 +700,12 @@ impl RecordStore for NodeRecordStore {
         #[cfg(feature = "open-metrics")]
         if let Some(metric) = &self.record_count_metric {
             let _ = metric.set(self.records.len() as i64);
+        }
+
+        if let Some((farthest_record, _)) = self.farthest_record.clone() {
+            if farthest_record == *k {
+                self.farthest_record = self.calculate_farthest();
+            }
         }
 
         let filename = Self::generate_filename(k);
@@ -661,23 +808,31 @@ impl RecordStore for ClientRecordStore {
     fn remove_provider(&mut self, _key: &Key, _provider: &PeerId) {}
 }
 
-// Using a linear growth function, and be tweaked by `received_payment_count` and `max_records`,
+// Using a linear growth function, and be tweaked by `received_payment_count`,
+// `max_records` and `live_time`(in seconds),
 // to allow nodes receiving too many replication copies can still got paid,
 // and gives an exponential pricing curve when storage reaches high.
-fn calculate_cost_for_records(
-    records_stored: usize,
-    received_payment_count: usize,
-    max_records: usize,
-) -> u64 {
+// and give extra reward (lower the quoting price to gain a better chance) to long lived nodes.
+pub fn calculate_cost_for_records(quoting_metrics: &QuotingMetrics) -> u64 {
     use std::cmp::{max, min};
+
+    let records_stored = quoting_metrics.close_records_stored;
+    let received_payment_count = quoting_metrics.received_payment_count;
+    let max_records = quoting_metrics.max_records;
+    let live_time = quoting_metrics.live_time;
 
     let ori_cost = (10 * records_stored) as u64;
     let divider = max(1, records_stored / max(1, received_payment_count)) as u64;
 
-    // 1.05.powf(200) = 18157
+    // Gaining one step for every day that staying in the network
+    let reward_steps: u64 = live_time / (24 * 3600);
+    let base_multiplier = 1.1_f32;
+    let rewarder = max(1, base_multiplier.powf(reward_steps as f32) as u64);
+
+    // 1.05.powf(800) = 9E+16
     // Given currently the max_records is set at 2048,
-    // hence setting the multiplier trigger at 90% of the max_records
-    let exponential_pricing_trigger = 9 * max_records / 10;
+    // hence setting the multiplier trigger at 60% of the max_records
+    let exponential_pricing_trigger = 6 * max_records / 10;
 
     let base_multiplier = 1.05_f32;
     let multiplier = max(
@@ -685,9 +840,10 @@ fn calculate_cost_for_records(
         base_multiplier.powf(records_stored.saturating_sub(exponential_pricing_trigger) as f32)
             as u64,
     );
-    let charge = max(10, ori_cost * multiplier / divider);
+
+    let charge = max(10, ori_cost.saturating_mul(multiplier) / divider / rewarder);
     // Deploy an upper cap safe_guard to the store_cost
-    min(3456788899, charge)
+    min(TOTAL_SUPPLY / CLOSE_GROUP_SIZE as u64, charge)
 }
 
 #[allow(trivial_casts)]
@@ -695,7 +851,7 @@ fn calculate_cost_for_records(
 mod tests {
 
     use super::*;
-    use crate::{close_group_majority, sort_peers_by_key, REPLICATE_RANGE};
+    use crate::{close_group_majority, sort_peers_by_key, REPLICATION_PEERS_COUNT};
     use bytes::Bytes;
     use eyre::ContextCompat;
     use libp2p::{core::multihash::Multihash, kad::RecordKey};
@@ -741,9 +897,102 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_cost_for_records() {
-        let sut = calculate_cost_for_records(2049, 2050, 2048);
-        assert_eq!(sut, 474814770);
+    fn test_calculate_max_cost_for_records() {
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: 2049,
+            max_records: 2048,
+            received_payment_count: 2049,
+            live_time: 1,
+        });
+        assert_eq!(sut, TOTAL_SUPPLY / CLOSE_GROUP_SIZE as u64);
+    }
+
+    #[test]
+    fn test_calculate_50_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 50 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 10240);
+    }
+    #[test]
+    fn test_calculate_60_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 60 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 12280);
+    }
+
+    #[test]
+    fn test_calculate_65_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 65 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 2023120);
+    }
+
+    #[test]
+    fn test_calculate_70_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 70 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 316248770);
+    }
+
+    #[test]
+    fn test_calculate_80_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 80 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 7978447975680);
+    }
+
+    #[test]
+    fn test_calculate_90_percent_cost_for_records() {
+        let percent = MAX_RECORDS_COUNT * 90 / 100;
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: percent,
+            max_records: 2048,
+            received_payment_count: percent,
+            live_time: 1,
+        });
+        // at this point we should be at max cost
+        assert_eq!(sut, 198121748221132800);
+    }
+
+    #[test]
+    fn test_calculate_min_cost_for_records() {
+        let sut = calculate_cost_for_records(&QuotingMetrics {
+            close_records_stored: 0,
+            max_records: 2048,
+            received_payment_count: 0,
+            live_time: 1,
+        });
+        assert_eq!(sut, 10);
     }
 
     #[test]
@@ -771,14 +1020,14 @@ mod tests {
             swarm_cmd_sender,
         );
 
-        let store_cost_before = store.store_cost();
+        let store_cost_before = store.store_cost(&r.key);
         // An initial unverified put should not write to disk
         assert!(store.put(r.clone()).is_ok());
         assert!(store.get(&r.key).is_none());
         // Store cost should not change if no PUT has been added
         assert_eq!(
-            store.store_cost(),
-            store_cost_before,
+            store.store_cost(&r.key).0,
+            store_cost_before.0,
             "store cost should not change over unverified put"
         );
 
@@ -835,13 +1084,20 @@ mod tests {
     #[tokio::test]
     async fn pruning_on_full() -> Result<()> {
         let max_iterations = 10;
+        // lower max records for faster testing
         let max_records = 50;
+
+        let temp_dir = std::env::temp_dir();
+        let unique_dir_name = uuid::Uuid::new_v4().to_string();
+        let storage_dir = temp_dir.join(unique_dir_name);
+        fs::create_dir_all(&storage_dir).expect("Failed to create directory");
 
         // Set the config::max_record to be 50, then generate 100 records
         // On storing the 51st to 100th record,
         // check there is an expected pruning behaviour got carried out.
         let store_config = NodeRecordStoreConfig {
             max_records,
+            storage_dir,
             ..Default::default()
         };
         let self_id = PeerId::random();
@@ -854,9 +1110,16 @@ mod tests {
             network_event_sender,
             swarm_cmd_sender,
         );
-        let mut stored_records: Vec<RecordKey> = vec![];
+        // keep track of everything ever stored, to check missing at the end are further away
+        let mut stored_records_at_some_point: Vec<RecordKey> = vec![];
         let self_address = NetworkAddress::from_peer(self_id);
-        for _ in 0..100 {
+
+        // keep track of fails to assert they're further than stored
+        let mut failed_records = vec![];
+
+        // try and put an excess of records
+        for _ in 0..max_records * 2 {
+            // println!("i: {i}");
             let record_key = NetworkAddress::from_peer(PeerId::random()).to_record_key();
             let value = match try_serialize_record(
                 &(0..50).map(|_| rand::random::<u8>()).collect::<Bytes>(),
@@ -873,68 +1136,76 @@ mod tests {
             };
 
             // Will be stored anyway.
-            assert!(store.put_verified(record, RecordType::Chunk).is_ok());
-            // We must also mark the record as stored (which would be triggered
-            // after the async write in nodes via NetworkEvent::CompletedWrite)
-            store.mark_as_stored(record_key.clone(), RecordType::Chunk);
+            let succeeded = store.put_verified(record, RecordType::Chunk).is_ok();
 
-            if stored_records.len() >= max_records {
-                // The list is already sorted by distance, hence always shall only prune the last 10.
-                let mut pruned_keys = vec![];
-                (0..10).for_each(|i| {
-                    let furthest_key = stored_records.remove(stored_records.len() - 1);
-                    println!(
-                        "chunk {i} {:?} shall be removed",
-                        PrettyPrintRecordKey::from(&furthest_key)
-                    );
-                    pruned_keys.push(furthest_key);
-                });
+            if !succeeded {
+                failed_records.push(record_key.clone());
+                println!("failed {:?}", PrettyPrintRecordKey::from(&record_key));
+            } else {
+                // We must also mark the record as stored (which would be triggered
+                // after the async write in nodes via NetworkEvent::CompletedWrite)
+                store.mark_as_stored(record_key.clone(), RecordType::Chunk);
 
-                for pruned_key in pruned_keys {
-                    println!(
-                        "record {:?} shall be pruned.",
-                        PrettyPrintRecordKey::from(&pruned_key)
-                    );
-                    // Confirm the pruned_key got removed, looping to allow async disk ops to complete.
-                    let mut iteration = 0;
-                    while iteration < max_iterations {
-                        if NodeRecordStore::read_from_disk(
-                            &store.encryption_details,
-                            &pruned_key,
-                            &store_config.storage_dir,
-                        )
-                        .is_none()
-                        {
-                            break;
-                        }
-                        sleep(Duration::from_millis(100)).await;
-                        iteration += 1;
+                println!("success sotred len: {:?} ", store.record_addresses().len());
+                stored_records_at_some_point.push(record_key.clone());
+                if stored_records_at_some_point.len() <= max_records {
+                    assert!(succeeded);
+                }
+                // loop over max_iterations times to ensure async disk write had time to complete.
+                let mut iteration = 0;
+                while iteration < max_iterations {
+                    if store.get(&record_key).is_some() {
+                        break;
                     }
-                    if iteration == max_iterations {
-                        panic!("record_store prune test failed with pruned record still exists.");
-                    }
+                    sleep(Duration::from_millis(100)).await;
+                    iteration += 1;
+                }
+                if iteration == max_iterations {
+                    panic!("record_store prune test failed with stored record {record_key:?} can't be read back");
                 }
             }
+        }
 
-            // loop over max_iterations times to ensure async disk write had time to complete.
-            let mut iteration = 0;
-            while iteration < max_iterations {
-                if store.get(&record_key).is_some() {
-                    break;
+        let stored_data_at_end = store.record_addresses();
+        assert!(
+            stored_data_at_end.len() == max_records,
+            "Stored records ({:?}) should be max_records, {max_records:?}",
+            stored_data_at_end.len(),
+        );
+
+        // now assert that we've stored at _least_ max records (likely many more over the liftime of the store)
+        assert!(
+            stored_records_at_some_point.len() >= max_records,
+            "we should have stored ata least max over time"
+        );
+
+        // now all failed records should be farther than the farthest stored record
+        let mut sorted_stored_data = stored_data_at_end.iter().collect_vec();
+
+        sorted_stored_data
+            .sort_by(|(a, _), (b, _)| self_address.distance(a).cmp(&self_address.distance(b)));
+
+        // next assert that all records stored are closer than the next closest of the failed records
+        if let Some((most_distant_data, _)) = sorted_stored_data.last() {
+            for failed_record in failed_records {
+                let failed_data = NetworkAddress::from_record_key(&failed_record);
+                assert!(
+                    self_address.distance(&failed_data) > self_address.distance(most_distant_data),
+                    "failed record {failed_data:?} should be farther than the farthest stored record {most_distant_data:?}"
+                );
+            }
+
+            // now for any stored data. It either shoudl still be stored OR further away than `most_distant_data`
+            for data in stored_records_at_some_point {
+                let data_addr = NetworkAddress::from_record_key(&data);
+                if !sorted_stored_data.contains(&(&data_addr, &RecordType::Chunk)) {
+                    assert!(
+                        self_address.distance(&data_addr)
+                            > self_address.distance(most_distant_data),
+                        "stored record should be farther than the farthest stored record"
+                    );
                 }
-                sleep(Duration::from_millis(100)).await;
-                iteration += 1;
             }
-            if iteration == max_iterations {
-                panic!("record_store prune test failed with stored record cann't be read back");
-            }
-
-            stored_records.push(record_key);
-            stored_records.sort_by(|a, b| {
-                let a = NetworkAddress::from_record_key(a);
-                let b = NetworkAddress::from_record_key(b);
-                self_address.distance(&a).cmp(&self_address.distance(&b))
-            });
         }
 
         Ok(())
@@ -942,12 +1213,17 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::mutable_key_type)]
-    async fn get_records_within_distance_range() -> eyre::Result<()> {
+    async fn get_records_within_bucket_range() -> eyre::Result<()> {
         let max_records = 50;
+
+        let temp_dir = std::env::temp_dir();
+        let unique_dir_name = uuid::Uuid::new_v4().to_string();
+        let storage_dir = temp_dir.join(unique_dir_name);
 
         // setup the store
         let store_config = NodeRecordStoreConfig {
             max_records,
+            storage_dir,
             ..Default::default()
         };
         let self_id = PeerId::random();
@@ -1001,17 +1277,62 @@ mod tests {
                 .wrap_err("Could not parse record store key")?,
         );
         // get the distance to this record from our local key
-        let distance = self_address.distance(&halfway_record_address);
+        let distance = self_address
+            .distance(&halfway_record_address)
+            .ilog2()
+            .unwrap_or(0);
 
-        store.set_distance_range(distance);
+        // must be plus one bucket from the halfway record
+        store.set_responsible_distance_range(distance);
 
-        let record_keys: HashSet<_> = store.records.keys().cloned().collect();
+        let record_keys = store.records.keys().collect();
 
-        // check that the number of records returned is correct
-        assert_eq!(
-            store.get_records_within_distance_range(&record_keys, distance),
-            stored_records.len() / 2
+        // check that the number of records returned is larger than half our records
+        // (ie, that we cover _at least_ all the records within our distance range)
+        assert!(
+            store.get_records_within_distance_range(record_keys, distance)
+                >= stored_records.len() / 2
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historic_quoting_metrics() -> Result<()> {
+        let temp_dir = std::env::temp_dir();
+        let unique_dir_name = uuid::Uuid::new_v4().to_string();
+        let storage_dir = temp_dir.join(unique_dir_name);
+        fs::create_dir_all(&storage_dir).expect("Failed to create directory");
+
+        let store_config = NodeRecordStoreConfig {
+            storage_dir,
+            ..Default::default()
+        };
+        let self_id = PeerId::random();
+        let (network_event_sender, _) = mpsc::channel(1);
+        let (swarm_cmd_sender, _) = mpsc::channel(1);
+
+        let mut store = NodeRecordStore::with_config(
+            self_id,
+            store_config.clone(),
+            network_event_sender.clone(),
+            swarm_cmd_sender.clone(),
+        );
+
+        store.payment_received();
+
+        // Wait for a while to allow the file written to disk.
+        sleep(Duration::from_millis(5000)).await;
+
+        let new_store = NodeRecordStore::with_config(
+            self_id,
+            store_config,
+            network_event_sender,
+            swarm_cmd_sender,
+        );
+
+        assert_eq!(1, new_store.received_payment_count);
+        assert_eq!(store.timestamp, new_store.timestamp);
 
         Ok(())
     }
@@ -1038,7 +1359,11 @@ mod tests {
             for _ in 0..num_of_chunks_per_itr {
                 let name = xor_name::rand::random();
                 let address = NetworkAddress::from_chunk_address(ChunkAddress::new(name));
-                match sort_peers_by_key(&peers_vec, &address.as_kbucket_key(), REPLICATE_RANGE) {
+                match sort_peers_by_key(
+                    &peers_vec,
+                    &address.as_kbucket_key(),
+                    REPLICATION_PEERS_COUNT,
+                ) {
                     Ok(peers_in_replicate_range) => {
                         let peers_in_replicate_range: Vec<PeerId> = peers_in_replicate_range
                             .iter()
@@ -1053,25 +1378,30 @@ mod tests {
                                 peers_in_close.iter().map(|peer_id| **peer_id).collect()
                             }
                             Err(err) => {
-                                panic!("Cann't find close range of {name:?} with error {err:?}")
+                                panic!("Can't find close range of {name:?} with error {err:?}")
                             }
                         };
 
                         let payee = pick_cheapest_payee(&peers_in_close, &peers);
 
                         for peer in peers_in_replicate_range.iter() {
-                            let entry = peers.entry(*peer).or_insert((0, 0, 0));
+                            let (close_records_stored, nanos_earnt, received_payment_count) =
+                                peers.entry(*peer).or_insert((0, 0, 0));
                             if *peer == payee {
-                                let cost =
-                                    calculate_cost_for_records(entry.0, entry.2, MAX_RECORDS_COUNT);
-                                entry.1 += cost;
-                                entry.2 += 1;
+                                let cost = calculate_cost_for_records(&QuotingMetrics {
+                                    close_records_stored: *close_records_stored,
+                                    max_records: MAX_RECORDS_COUNT,
+                                    received_payment_count: *received_payment_count,
+                                    live_time: 0,
+                                });
+                                *nanos_earnt += cost;
+                                *received_payment_count += 1;
                             }
-                            entry.0 += 1;
+                            *close_records_stored += 1;
                         }
                     }
                     Err(err) => {
-                        panic!("Cann't find replicate range of {name:?} with error {err:?}")
+                        panic!("Can't find replicate range of {name:?} with error {err:?}")
                     }
                 }
             }
@@ -1084,19 +1414,24 @@ mod tests {
             let mut max_earned = 0;
             let mut max_store_cost = 0;
 
-            for (_peer_id, stats) in peers.iter() {
-                let cost = calculate_cost_for_records(stats.0, stats.2, MAX_RECORDS_COUNT);
+            for (_peer_id, (close_records_stored, nanos_earnt, times_paid)) in peers.iter() {
+                let cost = calculate_cost_for_records(&QuotingMetrics {
+                    close_records_stored: *close_records_stored,
+                    max_records: MAX_RECORDS_COUNT,
+                    received_payment_count: *times_paid,
+                    live_time: 0,
+                });
                 // println!("{peer_id:?}:{stats:?} with storecost to be {cost}");
-                received_payment_count += stats.2;
-                if stats.1 == 0 {
+                received_payment_count += times_paid;
+                if *nanos_earnt == 0 {
                     empty_earned_nodes += 1;
                 }
 
-                if stats.1 < min_earned {
-                    min_earned = stats.1;
+                if *nanos_earnt < min_earned {
+                    min_earned = *nanos_earnt;
                 }
-                if stats.1 > max_earned {
-                    max_earned = stats.1;
+                if *nanos_earnt > max_earned {
+                    max_earned = *nanos_earnt;
                 }
                 if cost < min_store_cost {
                     min_store_cost = cost;
@@ -1176,7 +1511,12 @@ mod tests {
 
         for peer in peers_in_close {
             if let Some(stats) = peers.get(peer) {
-                let store_cost = calculate_cost_for_records(stats.0, stats.2, MAX_RECORDS_COUNT);
+                let store_cost = calculate_cost_for_records(&QuotingMetrics {
+                    close_records_stored: stats.0,
+                    max_records: MAX_RECORDS_COUNT,
+                    received_payment_count: stats.2,
+                    live_time: 0,
+                });
                 if store_cost < cheapest_cost {
                     cheapest_cost = store_cost;
                     payee = Some(*peer);

@@ -9,7 +9,7 @@
 use crate::target_arch::sleep;
 use libp2p::metrics::{Metrics as Libp2pMetrics, Recorder};
 use prometheus_client::{metrics::gauge::Gauge, registry::Registry};
-use sysinfo::{Pid, PidExt, ProcessExt, ProcessRefreshKind, System, SystemExt};
+use sysinfo::{Pid, ProcessRefreshKind, System};
 use tokio::time::Duration;
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(15);
@@ -93,12 +93,6 @@ impl NetworkMetrics {
                 sleep(UPDATE_INTERVAL).await;
             }
         });
-    }
-}
-
-impl Recorder<libp2p::gossipsub::Event> for NetworkMetrics {
-    fn record(&self, event: &libp2p::gossipsub::Event) {
-        self.libp2p_metrics.record(event)
     }
 }
 

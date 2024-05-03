@@ -9,6 +9,7 @@
 #[macro_use]
 extern crate tracing;
 
+pub mod acc_packet;
 mod api;
 mod audit;
 mod chunks;
@@ -18,7 +19,12 @@ mod faucet;
 mod files;
 mod folders;
 mod register;
+mod uploader;
 mod wallet;
+
+/// Test utils
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 // re-export used crates to make them available to app builders
 // this ensures the version of the crates used by the app builders are the same as the ones used by the client
@@ -28,23 +34,26 @@ pub use sn_protocol as protocol;
 pub use sn_registers as registers;
 pub use sn_transfers as transfers;
 
+const MAX_CONCURRENT_TASKS: usize = 32;
+
 pub use self::{
-    audit::{DagError, SpendDag, SpendDagGet},
+    audit::{DagError, SpendDag, SpendDagGet, SpendFault},
     error::Error,
     event::{ClientEvent, ClientEventsBroadcaster, ClientEventsReceiver},
-    faucet::{get_tokens_from_faucet, load_faucet_wallet_from_genesis_wallet},
+    faucet::fund_faucet_from_genesis_wallet,
     files::{
         download::{FilesDownload, FilesDownloadEvent},
-        upload::{FileUploadEvent, FilesUpload},
         FilesApi, BATCH_SIZE,
     },
     folders::{FolderEntry, FoldersApi, Metadata},
     register::ClientRegister,
+    uploader::{UploadCfg, UploadEvent, UploadSummary, Uploader},
     wallet::{broadcast_signed_spends, send, StoragePaymentResult, WalletClient},
 };
 pub(crate) use error::Result;
 
 use sn_networking::Network;
+use std::sync::Arc;
 
 #[cfg(target_arch = "wasm32")]
 use console_error_panic_hook;
@@ -110,10 +119,10 @@ pub async fn get_data(peer: &str, data_address: &str) -> std::result::Result<(),
     Ok(())
 }
 
-/// Client API implementation to store and get data.
+/// Provides a client for interacting with the network.
 #[derive(Clone)]
 pub struct Client {
     network: Network,
     events_broadcaster: ClientEventsBroadcaster,
-    signer: bls::SecretKey,
+    signer: Arc<bls::SecretKey>,
 }

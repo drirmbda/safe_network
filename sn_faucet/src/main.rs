@@ -16,16 +16,15 @@ use color_eyre::eyre::{bail, eyre, Result};
 use faucet_server::{restart_faucet_server, run_faucet_server};
 use indicatif::ProgressBar;
 use sn_client::{
-    get_tokens_from_faucet, load_faucet_wallet_from_genesis_wallet, Client, ClientEvent,
-    ClientEventsBroadcaster, ClientEventsReceiver,
+    acc_packet::load_account_wallet_or_create_with_mnemonic, fund_faucet_from_genesis_wallet, send,
+    Client, ClientEvent, ClientEventsBroadcaster, ClientEventsReceiver,
 };
-use sn_logging::{LogBuilder, LogOutputDest};
+use sn_logging::{Level, LogBuilder, LogOutputDest};
 use sn_peers_acquisition::{get_peers_from_args, PeersArgs};
-use sn_transfers::{get_faucet_data_dir, MainPubkey, NanoTokens, Transfer};
+use sn_transfers::{get_faucet_data_dir, HotWallet, MainPubkey, NanoTokens, Transfer};
 use std::{path::PathBuf, time::Duration};
 use tokio::{sync::broadcast::error::RecvError, task::JoinHandle};
-use tracing::{error, info};
-use tracing_core::Level;
+use tracing::{debug, error, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,43 +38,63 @@ async fn main() -> Result<()> {
         Some(bootstrap_peers)
     };
 
-    let _log_appender_guard = if let Some(log_output_dest) = opt.log_output_dest {
-        let logging_targets = vec![
-            // TODO: Reset to nice and clean defaults once we have a better idea of what we want
-            ("faucet".to_string(), Level::TRACE),
-            ("sn_faucet".to_string(), Level::TRACE),
-            ("sn_networking".to_string(), Level::DEBUG),
-            ("sn_build_info".to_string(), Level::TRACE),
-            ("sn_logging".to_string(), Level::TRACE),
-            ("sn_peers_acquisition".to_string(), Level::TRACE),
-            ("sn_protocol".to_string(), Level::TRACE),
-            ("sn_registers".to_string(), Level::TRACE),
-            ("sn_transfers".to_string(), Level::TRACE),
-        ];
-        let mut log_builder = LogBuilder::new(logging_targets);
-        log_builder.output_dest(log_output_dest);
-        log_builder.initialize()?
-    } else {
-        None
-    };
+    let logging_targets = vec![
+        // TODO: Reset to nice and clean defaults once we have a better idea of what we want
+        ("faucet".to_string(), Level::TRACE),
+        ("sn_client".to_string(), Level::TRACE),
+        ("sn_faucet".to_string(), Level::TRACE),
+        ("sn_networking".to_string(), Level::DEBUG),
+        ("sn_build_info".to_string(), Level::TRACE),
+        ("sn_logging".to_string(), Level::TRACE),
+        ("sn_peers_acquisition".to_string(), Level::TRACE),
+        ("sn_protocol".to_string(), Level::TRACE),
+        ("sn_registers".to_string(), Level::TRACE),
+        ("sn_transfers".to_string(), Level::TRACE),
+    ];
 
+    let mut log_builder = LogBuilder::new(logging_targets);
+    log_builder.output_dest(opt.log_output_dest);
+    let _log_handles = log_builder.initialize()?;
+
+    debug!(
+        "faucet built with git version: {}",
+        sn_build_info::git_info()
+    );
+    println!(
+        "faucet built with git version: {}",
+        sn_build_info::git_info()
+    );
     info!("Instantiating a SAFE Test Faucet...");
 
     let secret_key = bls::SecretKey::random();
     let broadcaster = ClientEventsBroadcaster::default();
-    let handle = spawn_connection_progress_bar(broadcaster.subscribe());
-    let result = Client::new(secret_key, bootstrap_peers, false, None, Some(broadcaster)).await;
-
-    // await on the progress bar to complete before handling the client result. If client errors out, we would
-    // want to make the progress bar clean up gracefully.
-    handle.await?;
-    match result {
-        Ok(client) => {
-            if let Err(err) = faucet_cmds(opt.cmd.clone(), &client).await {
-                error!("Failed to run faucet cmd {:?} with err {err:?}", opt.cmd)
-            }
+    let (progress_bar, handle) = spawn_connection_progress_bar(broadcaster.subscribe());
+    let result = Client::new(secret_key, bootstrap_peers, None, Some(broadcaster)).await;
+    let client = match result {
+        Ok(client) => client,
+        Err(err) => {
+            // clean up progress bar
+            progress_bar.finish_with_message("Could not connect to the network");
+            error!("Failed to get Client with err {err:?}");
+            return Err(err.into());
         }
-        Err(err) => error!("Failed to get Client with err {err:?}"),
+    };
+    handle.await?;
+
+    let root_dir = get_faucet_data_dir();
+    let mut funded_faucet = match load_account_wallet_or_create_with_mnemonic(&root_dir, None) {
+        Ok(wallet) => wallet,
+        Err(err) => {
+            println!("failed to load wallet for faucet! with error {err:?}");
+            error!("failed to load wallet for faucet! with error {err:?}");
+            return Err(err.into());
+        }
+    };
+
+    fund_faucet_from_genesis_wallet(&client, &mut funded_faucet).await?;
+
+    if let Err(err) = faucet_cmds(opt.cmd.clone(), &client, funded_faucet).await {
+        error!("Failed to run faucet cmd {:?} with err {err:?}", opt.cmd)
     }
 
     Ok(())
@@ -83,9 +102,10 @@ async fn main() -> Result<()> {
 
 /// Helper to subscribe to the client events broadcaster and spin up a progress bar that terminates when the
 /// client successfully connects to the network or if it errors out.
-fn spawn_connection_progress_bar(mut rx: ClientEventsReceiver) -> JoinHandle<()> {
+fn spawn_connection_progress_bar(mut rx: ClientEventsReceiver) -> (ProgressBar, JoinHandle<()>) {
     // Network connection progress bar
     let progress_bar = ProgressBar::new_spinner();
+    let progress_bar_clone = progress_bar.clone();
     progress_bar.enable_steady_tick(Duration::from_millis(120));
     progress_bar.set_message("Connecting to The SAFE Network...");
     let new_style = progress_bar.style().tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈🔗");
@@ -93,7 +113,7 @@ fn spawn_connection_progress_bar(mut rx: ClientEventsReceiver) -> JoinHandle<()>
 
     progress_bar.set_message("Connecting to The SAFE Network...");
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut peers_connected = 0;
         loop {
             match rx.recv().await {
@@ -120,7 +140,8 @@ fn spawn_connection_progress_bar(mut rx: ClientEventsReceiver) -> JoinHandle<()>
                 _ => {}
             }
         }
-    })
+    });
+    (progress_bar_clone, handle)
 }
 
 #[derive(Parser)]
@@ -138,7 +159,7 @@ struct Opt {
     ///  - Windows: C:\Users\<username>\AppData\Roaming\safe\client\logs
     #[allow(rustdoc::invalid_html_tags)]
     #[clap(long, value_parser = parse_log_output, verbatim_doc_comment, default_value = "data-dir")]
-    pub log_output_dest: Option<LogOutputDest>,
+    pub log_output_dest: LogOutputDest,
 
     #[command(flatten)]
     peers: PeersArgs,
@@ -176,13 +197,13 @@ enum SubCmd {
     RestartServer,
 }
 
-async fn faucet_cmds(cmds: SubCmd, client: &Client) -> Result<()> {
+async fn faucet_cmds(cmds: SubCmd, client: &Client, funded_wallet: HotWallet) -> Result<()> {
     match cmds {
         SubCmd::ClaimGenesis => {
-            claim_genesis(client).await?;
+            claim_genesis(client, funded_wallet).await?;
         }
         SubCmd::Send { amount, to } => {
-            send_tokens(client, &amount, &to).await?;
+            send_tokens(client, funded_wallet, &amount, &to).await?;
         }
         SubCmd::Server => {
             // shouldn't return except on error
@@ -196,9 +217,9 @@ async fn faucet_cmds(cmds: SubCmd, client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn claim_genesis(client: &Client) -> Result<()> {
+async fn claim_genesis(client: &Client, mut wallet: HotWallet) -> Result<()> {
     for i in 1..6 {
-        if let Err(e) = load_faucet_wallet_from_genesis_wallet(client).await {
+        if let Err(e) = fund_faucet_from_genesis_wallet(client, &mut wallet).await {
             println!("Failed to claim genesis: {e}");
         } else {
             println!("Genesis claimed!");
@@ -210,7 +231,7 @@ async fn claim_genesis(client: &Client) -> Result<()> {
 }
 
 /// returns the hex-encoded transfer
-async fn send_tokens(client: &Client, amount: &str, to: &str) -> Result<String> {
+async fn send_tokens(client: &Client, from: HotWallet, amount: &str, to: &str) -> Result<String> {
     let to = MainPubkey::from_hex(to)?;
     use std::str::FromStr;
     let amount = NanoTokens::from_str(amount)?;
@@ -221,7 +242,7 @@ async fn send_tokens(client: &Client, amount: &str, to: &str) -> Result<String> 
         ));
     }
 
-    let cash_note = get_tokens_from_faucet(amount, to, client).await?;
+    let cash_note = send(from, amount, to, client, true).await?;
     let transfer_hex = Transfer::transfer_from_cash_note(&cash_note)?.to_hex()?;
     println!("{transfer_hex}");
 

@@ -15,7 +15,7 @@ mod cmd;
 mod driver;
 mod error;
 mod event;
-mod get_record_handler;
+mod log_markers;
 #[cfg(feature = "open-metrics")]
 mod metrics;
 #[cfg(feature = "open-metrics")]
@@ -23,25 +23,27 @@ mod metrics_service;
 mod network_discovery;
 mod record_store;
 mod record_store_api;
+mod relay_manager;
 mod replication_fetcher;
+mod spends;
 pub mod target_arch;
 mod transfers;
+mod transport;
 
 // re-export arch dependent deps for use in the crate, or above
 pub use target_arch::{interval, sleep, spawn, Instant, Interval};
 
 pub use self::{
-    cmd::SwarmLocalState,
+    cmd::{NodeIssue, SwarmLocalState},
     driver::{GetRecordCfg, NetworkBuilder, PutRecordCfg, SwarmDriver, VerificationKind},
-    error::{Error, GetRecordError},
+    error::{GetRecordError, NetworkError},
     event::{MsgResponder, NetworkEvent},
-    record_store::NodeRecordStore,
-    transfers::get_singed_spends_from_record,
+    record_store::{calculate_cost_for_records, NodeRecordStore},
+    transfers::{get_raw_signed_spends_from_record, get_signed_spend_from_record},
 };
 
 use self::{cmd::SwarmCmd, error::Result};
 use backoff::{Error as BackoffError, ExponentialBackoff};
-use bytes::Bytes;
 use futures::future::select_all;
 use libp2p::{
     identity::Keypair,
@@ -52,14 +54,15 @@ use libp2p::{
 use rand::Rng;
 use sn_protocol::{
     error::Error as ProtocolError,
-    messages::{ChunkProof, Nonce, Query, QueryResponse, Request, Response},
+    messages::{ChunkProof, Cmd, Nonce, Query, QueryResponse, Request, Response},
     storage::{RecordType, RetryStrategy},
     NetworkAddress, PrettyPrintKBucketKey, PrettyPrintRecordKey,
 };
-use sn_transfers::{MainPubkey, NanoTokens, PaymentQuote};
+use sn_transfers::{MainPubkey, NanoTokens, PaymentQuote, QuotingMetrics};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
+    sync::Arc,
 };
 use tokio::sync::{
     mpsc::{self, Sender},
@@ -79,9 +82,9 @@ pub type PayeeQuote = (PeerId, MainPubkey, PaymentQuote);
 /// The size has been set to 5 for improved performance.
 pub const CLOSE_GROUP_SIZE: usize = 5;
 
-/// The range of peers that will be considered as close to a record target,
+/// The count of peers that will be considered as close to a record target,
 /// that a replication of the record shall be sent/accepted to/by the peer.
-pub const REPLICATE_RANGE: usize = CLOSE_GROUP_SIZE + 2;
+pub const REPLICATION_PEERS_COUNT: usize = CLOSE_GROUP_SIZE + 2;
 
 /// Majority of a given group (i.e. > 1/2).
 #[inline]
@@ -119,7 +122,7 @@ pub fn sort_peers_by_key<'a, T>(
     // bail early if that's not the case
     if CLOSE_GROUP_SIZE > peers.len() {
         warn!("Not enough peers in the k-bucket to satisfy the request");
-        return Err(Error::NotEnoughPeers {
+        return Err(NetworkError::NotEnoughPeers {
             found: peers.len(),
             required: CLOSE_GROUP_SIZE,
         });
@@ -152,20 +155,25 @@ pub fn sort_peers_by_key<'a, T>(
 /// API to interact with the underlying Swarm
 pub struct Network {
     pub swarm_cmd_sender: mpsc::Sender<SwarmCmd>,
-    pub peer_id: PeerId,
-    pub root_dir_path: PathBuf,
-    keypair: Keypair,
+    pub peer_id: Arc<PeerId>,
+    pub root_dir_path: Arc<PathBuf>,
+    keypair: Arc<Keypair>,
 }
 
 impl Network {
     /// Signs the given data with the node's keypair.
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
-        self.keypair.sign(msg).map_err(Error::from)
+        self.keypair.sign(msg).map_err(NetworkError::from)
     }
 
     /// Verifies a signature for the given data and the node's public key.
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
         self.keypair.public().verify(msg, sig)
+    }
+
+    /// Returns the protobuf serialised PublicKey to allow messaging out for share.
+    pub fn get_pub_key(&self) -> Vec<u8> {
+        self.keypair.public().encode_protobuf()
     }
 
     /// Dial the given peer at the given address.
@@ -197,7 +205,7 @@ impl Network {
         self.send_swarm_cmd(SwarmCmd::GetKBuckets { sender });
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Returns the closest peers to the given `NetworkAddress` that is fetched from the local
@@ -234,7 +242,7 @@ impl Network {
             }
             Err(err) => {
                 error!("When getting local knowledge of close peers to {key:?}, failed with error {err:?}");
-                Err(Error::InternalMsgChannelDropped)
+                Err(NetworkError::InternalMsgChannelDropped)
             }
         }
     }
@@ -247,7 +255,7 @@ impl Network {
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Returns all the PeerId from all the KBuckets from our local Routing Table
@@ -258,7 +266,7 @@ impl Network {
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Get the Chunk existence proof from the close nodes to the provided chunk address.
@@ -334,14 +342,20 @@ impl Network {
             sleep(waiting_time).await;
         }
 
-        Err(Error::FailedToVerifyChunkProof(chunk_address.clone()))
+        Err(NetworkError::FailedToVerifyChunkProof(
+            chunk_address.clone(),
+        ))
     }
 
     /// Get the store costs from the majority of the closest peers to the provided RecordKey.
     /// Record already exists will have a cost of zero to be returned.
+    ///
+    /// Ignore the quote from any peers from `ignore_peers`. This is useful if we want to repay a different PeerId
+    /// on failure.
     pub async fn get_store_costs_from_network(
         &self,
         record_address: NetworkAddress,
+        ignore_peers: Vec<PeerId>,
     ) -> Result<PayeeQuote> {
         // The requirement of having at least CLOSE_GROUP_SIZE
         // close nodes will be checked internally automatically.
@@ -354,6 +368,7 @@ impl Network {
 
         // loop over responses, generating an average fee and storing all responses along side
         let mut all_costs = vec![];
+        let mut all_quotes = vec![];
         for response in responses.into_values().flatten() {
             debug!(
                 "StoreCostReq for {record_address:?} received response: {:?}",
@@ -365,7 +380,8 @@ impl Network {
                     payment_address,
                     peer_address,
                 }) => {
-                    all_costs.push((peer_address, payment_address, quote));
+                    all_costs.push((peer_address.clone(), payment_address, quote.clone()));
+                    all_quotes.push((peer_address, quote));
                 }
                 Response::Query(QueryResponse::GetStoreCost {
                     quote: Err(ProtocolError::RecordExists(_)),
@@ -380,34 +396,39 @@ impl Network {
             }
         }
 
+        for peer_id in close_nodes.iter() {
+            let request = Request::Cmd(Cmd::QuoteVerification {
+                target: NetworkAddress::from_peer(*peer_id),
+                quotes: all_quotes.clone(),
+            });
+
+            self.send_req_ignore_reply(request, *peer_id);
+        }
+
         // Sort all_costs by the NetworkAddress proximity to record_address
         all_costs.sort_by(|(peer_address_a, _, _), (peer_address_b, _, _)| {
             record_address
                 .distance(peer_address_a)
                 .cmp(&record_address.distance(peer_address_b))
         });
+        #[allow(clippy::mutable_key_type)]
+        let ignore_peers = ignore_peers
+            .into_iter()
+            .map(NetworkAddress::from_peer)
+            .collect::<BTreeSet<_>>();
 
         // Ensure we dont have any further out nodes than `close_group_majority()`
         // This should ensure that if we didnt get all responses from close nodes,
         // we're less likely to be paying a node that is not in the CLOSE_GROUP
-        let all_costs = all_costs.into_iter().take(close_group_majority()).collect();
+        //
+        // Also filter out the peers.
+        let all_costs = all_costs
+            .into_iter()
+            .filter(|(peer_address, ..)| !ignore_peers.contains(peer_address))
+            .take(close_group_majority())
+            .collect();
 
         get_fees_from_store_cost_responses(all_costs)
-    }
-
-    /// Subscribe to given gossipsub topic
-    pub fn subscribe_to_topic(&self, topic_id: String) {
-        self.send_swarm_cmd(SwarmCmd::GossipsubSubscribe(topic_id));
-    }
-
-    /// Unsubscribe from given gossipsub topic
-    pub fn unsubscribe_from_topic(&self, topic_id: String) {
-        self.send_swarm_cmd(SwarmCmd::GossipsubUnsubscribe(topic_id));
-    }
-
-    /// Publish a msg on a given topic
-    pub fn publish_on_topic(&self, topic_id: String, msg: Bytes) {
-        self.send_swarm_cmd(SwarmCmd::GossipsubPublish { topic_id, msg });
     }
 
     /// Get a record from the network
@@ -428,10 +449,10 @@ impl Network {
         });
         let result = receiver.await.map_err(|e| {
             error!("When fetching record {pretty_key:?}, encountered a channel error {e:?}");
-            Error::InternalMsgChannelDropped
+            NetworkError::InternalMsgChannelDropped
         })?;
 
-        result.map_err(Error::from)
+        result.map_err(NetworkError::from)
     }
 
     /// Get the Record from the network
@@ -464,7 +485,7 @@ impl Network {
                 });
                 let result = receiver.await.map_err(|e| {
                 error!("When fetching record {pretty_key:?}, encountered a channel error {e:?}");
-                Error::InternalMsgChannelDropped
+                NetworkError::InternalMsgChannelDropped
             }).map_err(|err| BackoffError::Transient { err,  retry_after: None })?;
 
                 // log the results
@@ -495,14 +516,14 @@ impl Network {
                 // if we don't want to retry, throw permanent error
                 if cfg.retry_strategy.is_none() {
                     if let Err(e) = result {
-                        return Err(BackoffError::Permanent(Error::from(e)));
+                        return Err(BackoffError::Permanent(NetworkError::from(e)));
                     }
                 }
                 if result.is_err() {
                     trace!("Getting record from network of {pretty_key:?} via backoff...");
                 }
                 result.map_err(|err| BackoffError::Transient {
-                    err: Error::from(err),
+                    err: NetworkError::from(err),
                     retry_after: None,
                 })
             },
@@ -511,13 +532,16 @@ impl Network {
     }
 
     /// Get the cost of storing the next record from the network
-    pub async fn get_local_storecost(&self, key: RecordKey) -> Result<NanoTokens> {
+    pub async fn get_local_storecost(
+        &self,
+        key: RecordKey,
+    ) -> Result<(NanoTokens, QuotingMetrics)> {
         let (sender, receiver) = oneshot::channel();
         self.send_swarm_cmd(SwarmCmd::GetLocalStoreCost { key, sender });
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Notify the node receicced a payment.
@@ -535,17 +559,17 @@ impl Network {
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
-    /// Whether the target peer is considered as `in trouble` by self
-    pub async fn is_peer_bad(&self, target: NetworkAddress) -> Result<bool> {
+    /// Whether the target peer is considered blacklisted by self
+    pub async fn is_peer_shunned(&self, target: NetworkAddress) -> Result<bool> {
         let (sender, receiver) = oneshot::channel();
-        self.send_swarm_cmd(SwarmCmd::IsPeerInTrouble { target, sender });
+        self.send_swarm_cmd(SwarmCmd::IsPeerShunned { target, sender });
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Put `Record` to network
@@ -639,9 +663,9 @@ impl Network {
                     Ok(_) => {
                         debug!("Record {pretty_key:?} verified to be stored.");
                     }
-                    Err(Error::GetRecordError(GetRecordError::RecordNotFound)) => {
+                    Err(NetworkError::GetRecordError(GetRecordError::RecordNotFound)) => {
                         warn!("Record {pretty_key:?} not found after PUT, either rejected or not yet stored by nodes when we asked");
-                        return Err(Error::RecordNotStoredByNodes(
+                        return Err(NetworkError::RecordNotStoredByNodes(
                             NetworkAddress::from_record_key(&record_key),
                         ));
                     }
@@ -655,6 +679,12 @@ impl Network {
             }
         }
         response
+    }
+
+    /// Notify ReplicationFetch a fetch attempt is completed.
+    /// (but it won't trigger any real writes to disk, say fetched an old version of register)
+    pub fn notify_fetch_completed(&self, key: RecordKey) {
+        self.send_swarm_cmd(SwarmCmd::FetchCompleted(key))
     }
 
     /// Put `Record` to the local RecordStore
@@ -678,7 +708,7 @@ impl Network {
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Returns the Addresses of all the locally stored Records
@@ -690,7 +720,7 @@ impl Network {
 
         receiver
             .await
-            .map_err(|_e| Error::InternalMsgChannelDropped)
+            .map_err(|_e| NetworkError::InternalMsgChannelDropped)
     }
 
     /// Send `Request` to the given `PeerId` and await for the response. If `self` is the recipient,
@@ -731,20 +761,16 @@ impl Network {
         Ok(state)
     }
 
-    pub fn start_handle_gossip(&self) {
-        self.send_swarm_cmd(SwarmCmd::GossipHandler)
-    }
-
     pub fn trigger_interval_replication(&self) {
         self.send_swarm_cmd(SwarmCmd::TriggerIntervalReplication)
     }
 
-    pub fn notify_node_status(&self, peer_id: PeerId, addrs: HashSet<Multiaddr>, is_bad: bool) {
-        self.send_swarm_cmd(SwarmCmd::SendNodeStatus {
-            peer_id,
-            addrs,
-            is_bad,
-        });
+    pub fn record_node_issues(&self, peer_id: PeerId, issue: NodeIssue) {
+        self.send_swarm_cmd(SwarmCmd::RecordNodeIssue { peer_id, issue });
+    }
+
+    pub fn historical_verify_quotes(&self, quotes: Vec<(PeerId, PaymentQuote)>) {
+        self.send_swarm_cmd(SwarmCmd::QuoteVerification { quotes });
     }
 
     // Helper to send SwarmCmd
@@ -772,7 +798,7 @@ impl Network {
         // ensure we're not including self here
         if client {
             // remove our peer id from the calculations here:
-            closest_peers.retain(|&x| x != self.peer_id);
+            closest_peers.retain(|&x| x != *self.peer_id);
         }
         if tracing::level_enabled!(tracing::Level::TRACE) {
             let close_peers_pretty_print: Vec<_> = closest_peers
@@ -855,14 +881,14 @@ fn get_fees_from_store_cost_responses(
     let payee = all_costs
         .into_iter()
         .next()
-        .ok_or(Error::NoStoreCostResponses)?;
+        .ok_or(NetworkError::NoStoreCostResponses)?;
     info!("Final fees calculated as: {payee:?}");
     // we dont need to have the address outside of here for now
     let payee_id = if let Some(peer_id) = payee.0.as_peer_id() {
         peer_id
     } else {
         error!("Can't get PeerId from payee {:?}", payee.0);
-        return Err(Error::NoStoreCostResponses);
+        return Err(NetworkError::NoStoreCostResponses);
     };
     Ok((payee_id, payee.1, payee.2))
 }
@@ -907,11 +933,31 @@ pub(crate) fn multiaddr_pop_p2p(multiaddr: &mut Multiaddr) -> Option<PeerId> {
 }
 
 /// Build a `Multiaddr` with the p2p protocol filtered out.
+/// If it is a relayed address, then the relay's P2P address is preserved.
 pub(crate) fn multiaddr_strip_p2p(multiaddr: &Multiaddr) -> Multiaddr {
-    multiaddr
-        .iter()
-        .filter(|p| !matches!(p, Protocol::P2p(_)))
-        .collect()
+    let is_relayed = multiaddr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+
+    if is_relayed {
+        // Do not add any PeerId after we've found the P2PCircuit protocol. The prior one is the relay's PeerId which
+        // we should preserve.
+        let mut before_relay_protocol = true;
+        let mut new_multi_addr = Multiaddr::empty();
+        for p in multiaddr.iter() {
+            if matches!(p, Protocol::P2pCircuit) {
+                before_relay_protocol = false;
+            }
+            if matches!(p, Protocol::P2p(_)) && !before_relay_protocol {
+                continue;
+            }
+            new_multi_addr.push(p);
+        }
+        new_multi_addr
+    } else {
+        multiaddr
+            .iter()
+            .filter(|p| !matches!(p, Protocol::P2p(_)))
+            .collect()
+    }
 }
 
 pub(crate) fn send_swarm_cmd(swarm_cmd_sender: Sender<SwarmCmd>, cmd: SwarmCmd) {

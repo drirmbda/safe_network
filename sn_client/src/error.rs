@@ -15,6 +15,7 @@ use sn_transfers::{SignedSpend, SpendAddress};
 use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::time::Duration;
+use xor_name::XorName;
 
 /// Internal error.
 #[derive(Debug, Error)]
@@ -23,11 +24,14 @@ pub enum Error {
     #[error("Genesis error {0}")]
     GenesisError(#[from] sn_transfers::GenesisError),
 
+    #[error("Wallet Error {0}.")]
+    Wallet(#[from] sn_transfers::WalletError),
+
     #[error("Transfer Error {0}.")]
-    Transfers(#[from] sn_transfers::WalletError),
+    Transfer(#[from] sn_transfers::TransferError),
 
     #[error("Network Error {0}.")]
-    Network(#[from] sn_networking::Error),
+    Network(#[from] sn_networking::NetworkError),
 
     #[error("Protocol error {0}.")]
     Protocol(#[from] sn_protocol::error::Error),
@@ -37,6 +41,9 @@ pub enum Error {
 
     #[error("Chunks error {0}.")]
     Chunks(#[from] super::chunks::Error),
+
+    #[error("Decrypting a Folder's item failed: {0}")]
+    FolderEntryDecryption(EntryHash),
 
     #[error("SelfEncryption Error {0}.")]
     SelfEncryptionIO(#[from] self_encryption::Error),
@@ -65,9 +72,6 @@ pub enum Error {
     #[error("Deserialization error: {0:?}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 
-    #[error("There is no Spend record at this address: {0:?}")]
-    MissingSpendRecord(SpendAddress),
-
     #[error(
         "Content branches detected in the Register which need to be merged/resolved by user. \
         Entries hashes of branches are: {0:?}"
@@ -90,9 +94,6 @@ pub enum Error {
     #[error("Could not connect to the network in {0:?}")]
     ConnectionTimeout(Duration),
 
-    #[error("Too many sequential upload payment failures")]
-    SequentialUploadPaymentError,
-
     #[error("Could not send files event")]
     CouldNotSendFilesEvent,
 
@@ -105,9 +106,52 @@ pub enum Error {
     #[error("Error occurred while assembling the downloaded chunks")]
     FailedToAssembleDownloadedChunks,
 
+    #[error("Task completion notification channel is done")]
+    FailedToReadFromNotificationChannel,
+
+    #[error("Could not find register after batch sync: {0:?}")]
+    RegisterNotFoundAfterUpload(XorName),
+
+    #[error("Could not connect due to incompatible network protocols. Our protocol: {0} Network protocol: {1}")]
+    UnsupportedProtocol(String, String),
+
+    // ------ Upload Errors --------
+    #[error("Overflow occurred while adding values")]
+    NumericOverflow,
+
+    #[error("Uploadable item not found: {0:?}")]
+    UploadableItemNotFound(XorName),
+
+    #[error("Invalid upload item found")]
+    InvalidUploadItemFound,
+
+    #[error("The state tracked by the uploader is empty")]
+    UploadStateTrackerIsEmpty,
+
+    #[error("Internal task channel dropped")]
+    InternalTaskChannelDropped,
+
+    #[error("Multiple consecutive network errors reported during upload")]
+    SequentialNetworkErrors,
+
+    #[error("Too many sequential payment errors reported during upload")]
+    SequentialUploadPaymentError,
+
+    #[error("The maximum specified repayments were made for the address: {0:?}")]
+    MaximumRepaymentsReached(XorName),
+
     #[error("Error occurred when access wallet file")]
     FailedToAccessWallet,
 
-    #[error("Task completion notification channel is done")]
-    FailedToReadFromNotificationChannel,
+    #[error("Error parsing entropy for mnemonic phrase")]
+    FailedToParseEntropy,
+
+    #[error("Error parsing mnemonic phrase")]
+    FailedToParseMnemonic,
+
+    #[error("Invalid mnemonic seed phrase")]
+    InvalidMnemonicSeedPhrase,
+
+    #[error("SecretKey could not be created from the provided bytes")]
+    InvalidKeyBytes,
 }

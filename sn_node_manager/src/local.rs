@@ -6,17 +6,18 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use crate::{helpers::get_bin_version, service::ServiceControl};
-use color_eyre::{
-    eyre::{eyre, OptionExt},
-    Result,
-};
+use crate::helpers::get_bin_version;
+use color_eyre::eyre::OptionExt;
+use color_eyre::{eyre::eyre, Result};
 use colored::Colorize;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 #[cfg(test)]
 use mockall::automock;
-use sn_node_rpc_client::{RpcActions, RpcClient};
-use sn_protocol::node_registry::{Faucet, Node, NodeRegistry, NodeStatus};
+use sn_service_management::{
+    control::ServiceControl,
+    rpc::{RpcActions, RpcClient},
+    FaucetServiceData, NodeRegistry, NodeServiceData, ServiceStatus,
+};
 use sn_transfers::get_faucet_data_dir;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -24,7 +25,7 @@ use std::{
     process::{Command, Stdio},
     str::FromStr,
 };
-use sysinfo::{Pid, ProcessExt, System, SystemExt};
+use sysinfo::{Pid, System};
 
 #[cfg_attr(test, automock)]
 pub trait Launcher {
@@ -32,6 +33,7 @@ pub trait Launcher {
     fn launch_faucet(&self, genesis_multiaddr: &Multiaddr) -> Result<u32>;
     fn launch_node(
         &self,
+        owner: String,
         rpc_socket_addr: SocketAddr,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<()>;
@@ -65,10 +67,15 @@ impl Launcher for LocalSafeLauncher {
 
     fn launch_node(
         &self,
+        owner: String,
         rpc_socket_addr: SocketAddr,
         bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<()> {
         let mut args = Vec::new();
+
+        args.push("--owner".to_string());
+        args.push(owner);
+
         if bootstrap_peers.is_empty() {
             args.push("--first".to_string())
         } else {
@@ -161,6 +168,7 @@ pub fn kill_network(node_registry: &NodeRegistry, keep_directories: bool) -> Res
 
 pub struct LocalNetworkOptions {
     pub faucet_bin_path: PathBuf,
+    pub owner: String,
     pub join: bool,
     pub interval: u64,
     pub node_count: u16,
@@ -199,6 +207,7 @@ pub async fn run_network(
         let node = run_node(
             RunNodeOptions {
                 version: get_bin_version(&launcher.get_safenode_path())?,
+                owner: options.owner.clone(),
                 number,
                 genesis: true,
                 interval: options.interval,
@@ -226,6 +235,7 @@ pub async fn run_network(
         let node = run_node(
             RunNodeOptions {
                 version: get_bin_version(&launcher.get_safenode_path())?,
+                owner: options.owner.clone(),
                 number,
                 genesis: false,
                 interval: options.interval,
@@ -255,13 +265,13 @@ pub async fn run_network(
         println!("Launching the faucet server...");
         let pid = launcher.launch_faucet(&bootstrap_peers[0])?;
         let version = get_bin_version(&options.faucet_bin_path)?;
-        let faucet = Faucet {
+        let faucet = FaucetServiceData {
             faucet_path: options.faucet_bin_path,
             local: true,
             log_dir_path: get_faucet_data_dir(),
             pid: Some(pid),
             service_name: "faucet".to_string(),
-            status: NodeStatus::Running,
+            status: ServiceStatus::Running,
             user: get_username()?,
             version,
         };
@@ -273,6 +283,7 @@ pub async fn run_network(
 
 pub struct RunNodeOptions {
     pub version: String,
+    pub owner: String,
     pub number: u16,
     pub genesis: bool,
     pub interval: u64,
@@ -284,9 +295,32 @@ pub async fn run_node(
     run_options: RunNodeOptions,
     launcher: &dyn Launcher,
     rpc_client: &dyn RpcActions,
-) -> Result<Node> {
+) -> Result<NodeServiceData> {
+    let user = match get_username() {
+        Ok(user_name) => {
+            println!("parsed env set user_name is {user_name:?}");
+            if user_name.is_empty() {
+                println!(
+                    "Env set user_name is empty, using owner ({:?}) passed via cli.",
+                    run_options.owner
+                );
+                run_options.owner.clone()
+            } else {
+                user_name
+            }
+        }
+        Err(_err) => {
+            println!(
+                "cannot parse user_name from env, using owner ({:?}) passed via cli.",
+                run_options.owner
+            );
+            run_options.owner.clone()
+        }
+    };
+
     println!("Launching node {}...", run_options.number);
     launcher.launch_node(
+        user.clone(),
         run_options.rpc_socket_addr,
         run_options.bootstrap_peers.clone(),
     )?;
@@ -302,23 +336,24 @@ pub async fn run_node(
         .map(|addr| addr.with(Protocol::P2p(node_info.peer_id)))
         .collect();
 
-    Ok(Node {
+    Ok(NodeServiceData {
         connected_peers,
+        data_dir_path: node_info.data_path,
         genesis: run_options.genesis,
-        // not read for local network.
+        home_network: false,
+        listen_addr: Some(listen_addrs),
         local: true,
+        log_dir_path: node_info.log_path,
+        number: run_options.number,
+        peer_id: Some(peer_id),
+        pid: Some(node_info.pid),
+        reward_balance: None,
+        rpc_socket_addr: run_options.rpc_socket_addr,
+        safenode_path: launcher.get_safenode_path(),
+        status: ServiceStatus::Running,
         service_name: format!("safenode-local{}", run_options.number),
         user: get_username()?,
-        number: run_options.number,
-        rpc_socket_addr: run_options.rpc_socket_addr,
         version: run_options.version.to_string(),
-        status: NodeStatus::Running,
-        pid: Some(node_info.pid),
-        listen_addr: Some(listen_addrs),
-        peer_id: Some(peer_id),
-        log_dir_path: node_info.log_path,
-        data_dir_path: node_info.data_path,
-        safenode_path: launcher.get_safenode_path(),
     })
 }
 
@@ -387,8 +422,9 @@ mod tests {
     use libp2p_identity::PeerId;
     use mockall::mock;
     use mockall::predicate::*;
-    use sn_node_rpc_client::{
-        NetworkInfo, NodeInfo, RecordAddress, Result as RpcResult, RpcActions,
+    use sn_service_management::{
+        error::Result as RpcResult,
+        rpc::{NetworkInfo, NodeInfo, RecordAddress, RpcActions},
     };
     use std::str::FromStr;
 
@@ -399,12 +435,10 @@ mod tests {
             async fn node_info(&self) -> RpcResult<NodeInfo>;
             async fn network_info(&self) -> RpcResult<NetworkInfo>;
             async fn record_addresses(&self) -> RpcResult<Vec<RecordAddress>>;
-            async fn gossipsub_subscribe(&self, topic: &str) -> RpcResult<()>;
-            async fn gossipsub_unsubscribe(&self, topic: &str) -> RpcResult<()>;
-            async fn gossipsub_publish(&self, topic: &str, message: &str) -> RpcResult<()>;
             async fn node_restart(&self, delay_millis: u64, retain_peer_id: bool) -> RpcResult<()>;
             async fn node_stop(&self, delay_millis: u64) -> RpcResult<()>;
             async fn node_update(&self, delay_millis: u64) -> RpcResult<()>;
+            async fn update_log_level(&self, log_levels: String) -> RpcResult<()>;
         }
     }
 
@@ -412,14 +446,15 @@ mod tests {
     async fn run_node_should_launch_the_genesis_node() -> Result<()> {
         let mut mock_launcher = MockLauncher::new();
         let mut mock_rpc_client = MockRpcClient::new();
+        let owner = get_username()?;
 
         let peer_id = PeerId::from_str("12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR")?;
         let rpc_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 13000);
         mock_launcher
             .expect_launch_node()
-            .with(eq(rpc_socket_addr), eq(vec![]))
+            .with(eq(owner.clone()), eq(rpc_socket_addr), eq(vec![]))
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         mock_launcher
             .expect_wait()
             .with(eq(100))
@@ -456,6 +491,7 @@ mod tests {
         let node = run_node(
             RunNodeOptions {
                 version: "0.100.12".to_string(),
+                owner,
                 number: 1,
                 genesis: true,
                 interval: 100,
@@ -481,7 +517,7 @@ mod tests {
         assert_eq!(node.number, 1);
         assert_eq!(node.pid, Some(1000));
         assert_eq!(node.rpc_socket_addr, rpc_socket_addr);
-        assert_eq!(node.status, NodeStatus::Running);
+        assert_eq!(node.status, ServiceStatus::Running);
         assert_eq!(node.safenode_path, PathBuf::from("/usr/local/bin/safenode"));
 
         Ok(())

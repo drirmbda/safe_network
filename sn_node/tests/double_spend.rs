@@ -10,7 +10,7 @@ mod common;
 
 use assert_fs::TempDir;
 use assert_matches::assert_matches;
-use common::client::{get_gossip_client_and_funded_wallet, get_wallet};
+use common::client::{get_client_and_funded_wallet, get_wallet};
 use eyre::Result;
 use sn_logging::LogBuilder;
 use sn_transfers::{
@@ -27,8 +27,7 @@ async fn cash_note_transfer_double_spend_fail() -> Result<()> {
     // create 1 wallet add money from faucet
     let first_wallet_dir = TempDir::new()?;
 
-    let (client, mut first_wallet) =
-        get_gossip_client_and_funded_wallet(first_wallet_dir.path()).await?;
+    let (client, mut first_wallet) = get_client_and_funded_wallet(first_wallet_dir.path()).await?;
     let first_wallet_balance = first_wallet.balance().as_nano();
 
     // create wallet 2 and 3 to receive money from 1
@@ -50,8 +49,18 @@ async fn cash_note_transfer_double_spend_fail() -> Result<()> {
 
     let mut rng = rng::thread_rng();
 
-    let to2_unique_key = (amount, to2, DerivationIndex::random(&mut rng));
-    let to3_unique_key = (amount, to3, DerivationIndex::random(&mut rng));
+    let to2_unique_key = (
+        amount,
+        Default::default(),
+        to2,
+        DerivationIndex::random(&mut rng),
+    );
+    let to3_unique_key = (
+        amount,
+        Default::default(),
+        to3,
+        DerivationIndex::random(&mut rng),
+    );
     let reason_hash = Hash::default();
 
     let transfer_to_2 =
@@ -74,8 +83,8 @@ async fn cash_note_transfer_double_spend_fail() -> Result<()> {
     // check the CashNotes, it should fail
     info!("Verifying the transfers from first wallet...");
 
-    let cash_notes_for_2: Vec<_> = transfer_to_2.created_cash_notes.clone();
-    let cash_notes_for_3: Vec<_> = transfer_to_3.created_cash_notes.clone();
+    let cash_notes_for_2: Vec<_> = transfer_to_2.cash_notes_for_recipient.clone();
+    let cash_notes_for_3: Vec<_> = transfer_to_3.cash_notes_for_recipient.clone();
 
     let could_err1 = client.verify_cashnote(&cash_notes_for_2[0]).await;
     let could_err2 = client.verify_cashnote(&cash_notes_for_3[0]).await;
@@ -91,8 +100,7 @@ async fn genesis_double_spend_fail() -> Result<()> {
 
     // create a client and an unused wallet to make sure some money already exists in the system
     let first_wallet_dir = TempDir::new()?;
-    let (client, mut first_wallet) =
-        get_gossip_client_and_funded_wallet(first_wallet_dir.path()).await?;
+    let (client, mut first_wallet) = get_client_and_funded_wallet(first_wallet_dir.path()).await?;
     let first_wallet_addr = first_wallet.address();
 
     // create a new genesis wallet with the intention to spend genesis again
@@ -110,6 +118,7 @@ async fn genesis_double_spend_fail() -> Result<()> {
     let mut rng = rng::thread_rng();
     let recipient = (
         genesis_amount,
+        Default::default(),
         first_wallet_addr,
         DerivationIndex::random(&mut rng),
     );
@@ -127,12 +136,13 @@ async fn genesis_double_spend_fail() -> Result<()> {
     assert!(res.is_ok());
 
     // put the bad cashnote in the first wallet
-    first_wallet.deposit_and_store_to_disk(&transfer.created_cash_notes)?;
+    first_wallet.deposit_and_store_to_disk(&transfer.cash_notes_for_recipient)?;
 
     // now try to spend this illegitimate cashnote (direct descendant of double spent genesis)
     let (genesis_cashnote_and_others, exclusive_access) = first_wallet.available_cash_notes()?;
     let recipient = (
         genesis_amount,
+        Default::default(),
         second_wallet_addr,
         DerivationIndex::random(&mut rng),
     );

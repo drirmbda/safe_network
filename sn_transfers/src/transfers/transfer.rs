@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::error::{Error, Result};
+use crate::error::{Result, TransferError};
 
 /// Transfer sent to a recipient
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
@@ -61,7 +61,7 @@ impl Transfer {
         let recipient = cash_note.main_pubkey;
         let u = CashNoteRedemption::from_cash_note(cash_note)?;
         let t = Self::create(vec![u], recipient)
-            .map_err(|_| Error::CashNoteRedemptionEncryptionFailed)?;
+            .map_err(|_| TransferError::CashNoteRedemptionEncryptionFailed)?;
         Ok(t)
     }
 
@@ -106,17 +106,18 @@ impl Transfer {
 
     /// Deserializes a `Transfer` represented as a hex string to a `Transfer`.
     pub fn from_hex(hex: &str) -> Result<Self> {
-        let mut bytes = hex::decode(hex).map_err(|_| Error::TransferDeserializationFailed)?;
+        let mut bytes =
+            hex::decode(hex).map_err(|_| TransferError::TransferDeserializationFailed)?;
         bytes.reverse();
-        let transfer: Self =
-            rmp_serde::from_slice(&bytes).map_err(|_| Error::TransferDeserializationFailed)?;
+        let transfer: Self = rmp_serde::from_slice(&bytes)
+            .map_err(|_| TransferError::TransferDeserializationFailed)?;
         Ok(transfer)
     }
 
     /// Serialize this `Transfer` instance to a readable hex string that a human can copy paste
     pub fn to_hex(&self) -> Result<String> {
         let mut serialized =
-            rmp_serde::to_vec(&self).map_err(|_| Error::TransferSerializationFailed)?;
+            rmp_serde::to_vec(&self).map_err(|_| TransferError::TransferSerializationFailed)?;
         serialized.reverse();
         Ok(hex::encode(serialized))
     }
@@ -137,36 +138,48 @@ pub struct CashNoteRedemption {
     /// spentbook entry of one of one of the inputs (parent spends)
     /// using data found at this address the owner can check that the output is valid money
     pub parent_spend: SpendAddress,
+    /// For what purpose this cash_note was created
+    pub purpose: String,
 }
 
 impl CashNoteRedemption {
     /// Create a new CashNoteRedemption
-    pub fn new(derivation_index: DerivationIndex, parent_spend: SpendAddress) -> Self {
+    pub fn new(
+        derivation_index: DerivationIndex,
+        parent_spend: SpendAddress,
+        purpose: String,
+    ) -> Self {
         Self {
             derivation_index,
             parent_spend,
+            purpose,
         }
     }
 
     pub fn from_cash_note(cash_note: &CashNote) -> Result<Self> {
         let derivation_index = cash_note.derivation_index();
-        let parent_spend = match cash_note.signed_spends.iter().next() {
+        let parent_spend = match cash_note.parent_spends.iter().next() {
             Some(s) => SpendAddress::from_unique_pubkey(s.unique_pubkey()),
             None => {
-                return Err(Error::CashNoteHasNoParentSpends);
+                return Err(TransferError::CashNoteHasNoParentSpends);
             }
         };
-        Ok(Self::new(derivation_index, parent_spend))
+        Ok(Self::new(
+            derivation_index,
+            parent_spend,
+            cash_note.purpose.clone(),
+        ))
     }
 
     /// Serialize the CashNoteRedemption to bytes
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        rmp_serde::to_vec(self).map_err(|_| Error::CashNoteRedemptionSerialisationFailed)
+        rmp_serde::to_vec(self).map_err(|_| TransferError::CashNoteRedemptionSerialisationFailed)
     }
 
     /// Deserialize the CashNoteRedemption from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        rmp_serde::from_slice(bytes).map_err(|_| Error::CashNoteRedemptionSerialisationFailed)
+        rmp_serde::from_slice(bytes)
+            .map_err(|_| TransferError::CashNoteRedemptionSerialisationFailed)
     }
 
     /// Encrypt the CashNoteRedemption to a public key
@@ -180,7 +193,7 @@ impl CashNoteRedemption {
         let bytes = sk
             .secret_key()
             .decrypt(cypher)
-            .ok_or(Error::CashNoteRedemptionDecryptionFailed)?;
+            .ok_or(TransferError::CashNoteRedemptionDecryptionFailed)?;
         Self::from_bytes(&bytes)
     }
 }
@@ -197,6 +210,7 @@ mod tests {
         let cashnote_redemption = CashNoteRedemption::new(
             DerivationIndex([42; 32]),
             SpendAddress::new(XorName::random(rng)),
+            Default::default(),
         );
         let sk = MainSecretKey::random();
         let pk = sk.main_pubkey();
@@ -217,6 +231,7 @@ mod tests {
         let cashnote_redemption = CashNoteRedemption::new(
             DerivationIndex([42; 32]),
             SpendAddress::new(XorName::random(rng)),
+            Default::default(),
         );
         let sk = MainSecretKey::random();
         let pk = sk.main_pubkey();
