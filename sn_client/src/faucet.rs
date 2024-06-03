@@ -8,6 +8,8 @@
 
 use crate::{wallet::send, Client, Error, Result};
 use sn_transfers::{load_genesis_wallet, HotWallet, NanoTokens, FOUNDATION_PK};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::fs;
 
 const INITIAL_FAUCET_BALANCE: NanoTokens = NanoTokens::from(900000000000000000);
 
@@ -92,6 +94,25 @@ pub async fn fund_faucet_from_genesis_wallet(
         println!(
             "Successfully verified the transfer from genesis to foundation on the second try."
         );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // write the foundation cashnote to disk
+            let root_dir = faucet_wallet.api().wallet_dir();
+
+            let foundation_cashnote_path = root_dir.join("foundation_cashnote.cash_note");
+
+            debug!("Writing cash note to: {foundation_cashnote_path:?}");
+            let hex = foundation_cashnote
+                .to_hex()
+                .map_err(|_| Error::GenesisDisbursement)?;
+
+            if let Err(error) = fs::write(foundation_cashnote_path, hex).await {
+                error!("Could not write the foundation cashnote to disk: {error}.");
+                return Err(Error::from(error));
+            }
+        }
+
         info!("Successfully verified the transfer from genesis to foundation on the second try.");
     }
 
