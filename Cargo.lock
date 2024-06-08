@@ -7162,7 +7162,7 @@ dependencies = [
 
 [[package]]
 name = "sn_faucet"
-version = "0.4.27"
+version = "0.4.28-alpha.1"
 dependencies = [
  "assert_fs",
  "base64 0.22.1",
@@ -7275,7 +7275,7 @@ dependencies = [
 
 [[package]]
 name = "sn_node"
-version = "0.108.2"
+version = "0.108.3-alpha.1"
 dependencies = [
  "assert_fs",
  "assert_matches",
